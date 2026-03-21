@@ -620,6 +620,95 @@ def calculate_macro_score(macro_df=None):
     }
 
 
+def detect_risk_flags(row):
+    """
+    リスクフラグ検出
+
+    5つの条件をチェックし、該当するアラートをリストで返す。
+    各アラート: {"type": str, "label": str, "action": str}
+    """
+    flags = []
+    price = row.get("price", 0)
+    change_pct = row.get("change_pct")
+    vol_ratio = row.get("vol_ratio")
+    pe_ratio = row.get("pe_ratio")
+    pos_52w = row.get("pos_52w_pct")
+    rsi = row.get("rsi_14")
+    macd_val = row.get("macd")
+
+    # 1. 急落アラート: 1日で-5%以上下落 かつ 出来高比率3x以上
+    if (change_pct is not None and not np.isnan(change_pct) and change_pct <= -5
+            and vol_ratio is not None and not np.isnan(vol_ratio) and vol_ratio >= 3.0):
+        flags.append({
+            "type": "crash",
+            "label": "急落アラート",
+            "action": "ニュースを確認してください。粉飾決算・訴訟・規制リスクの可能性",
+        })
+
+    # 2. 高ボラティリティ警告: vol_5d データから推定
+    #    (vol_5dカラムは "v1,v2,v3,v4,v5" 形式の文字列)
+    vol_5d_str = row.get("vol_5d")
+    if vol_5d_str and isinstance(vol_5d_str, str):
+        try:
+            vols = [float(v) for v in vol_5d_str.split(",") if v.strip()]
+            if len(vols) >= 3:
+                # 出来高の変動率から高ボラを推定
+                vol_std = np.std(vols) / (np.mean(vols) + 1e-10)
+                if vol_std > 0.8:  # 出来高が非常に不安定
+                    flags.append({
+                        "type": "high_volatility",
+                        "label": "高ボラティリティ警告",
+                        "action": "短期トレードには不向き。ポジションサイズを小さく",
+                    })
+        except (ValueError, TypeError):
+            pass
+
+    # change_pctの絶対値が大きい場合も高ボラ判定
+    if (change_pct is not None and not np.isnan(change_pct)
+            and abs(change_pct) >= 10):
+        if not any(f["type"] == "high_volatility" for f in flags):
+            flags.append({
+                "type": "high_volatility",
+                "label": "高ボラティリティ警告",
+                "action": "短期トレードには不向き。ポジションサイズを小さく",
+            })
+
+    # 3. PER異常値: PER > 200 または PER < 0（赤字）
+    if pe_ratio is not None and not np.isnan(pe_ratio):
+        if pe_ratio > 200 or pe_ratio < 0:
+            flags.append({
+                "type": "per_abnormal",
+                "label": "PER異常値",
+                "action": "投機的銘柄。成長期待で買うなら全体の5%以下に",
+            })
+
+    # 4. 52週安値更新中: pos_52w_pct < 3%
+    if pos_52w is not None and not np.isnan(pos_52w) and pos_52w < 3:
+        flags.append({
+            "type": "new_52w_low",
+            "label": "52週安値更新中",
+            "action": "底値を狙うナンピンは危険。反転確認まで待つ",
+        })
+
+    # 5. 逆行シグナル:
+    #    - 株価下落中(change_pct<0)なのにRSIが50以上に上昇
+    #    - MACDがプラスなのに株価が下がっている
+    divergence = False
+    if (change_pct is not None and not np.isnan(change_pct) and change_pct < -3):
+        if rsi is not None and not np.isnan(rsi) and rsi > 50:
+            divergence = True
+        if macd_val is not None and not np.isnan(macd_val) and macd_val > 0:
+            divergence = True
+    if divergence:
+        flags.append({
+            "type": "divergence",
+            "label": "逆行シグナル",
+            "action": "テクニカル指標の信頼度が低い。ファンダメンタルズで判断",
+        })
+
+    return flags
+
+
 def analyze(stock_df, sentiment_df=None, config=None):
     """全銘柄を統合スコアリング"""
     if config is None:
@@ -679,6 +768,31 @@ def analyze(stock_df, sentiment_df=None, config=None):
             macro_prefix = f"[市況: {macro_label}({macro_bonus:+d}pt)] "
             analysis_comment = macro_prefix + analysis_comment
 
+        # リスクフラグ検出
+        risk_flags = detect_risk_flags(r)
+        risk_count = len(risk_flags)
+        risk_labels = " / ".join(f["label"] for f in risk_flags) if risk_flags else ""
+        risk_actions = " / ".join(f["action"] for f in risk_flags) if risk_flags else ""
+
+        # リスクフラグによるスコア減点
+        if risk_count >= 2:
+            total = max(0, total - 20)
+        elif risk_count == 1:
+            total = max(0, total - 10)
+
+        # リスクフラグありの場合シグナルに警告付与
+        if risk_flags:
+            signal_suffix = " ⚠️要確認"
+            # シグナル再判定（減点後の total で）
+            if total >= 70:
+                signal = "★★★ 強い買い" + signal_suffix
+            elif total >= 55:
+                signal = "★★ 買い" + signal_suffix
+            elif total >= 40:
+                signal = "★ 要注目" + signal_suffix
+            else:
+                signal = "△ 様子見" + signal_suffix
+
         r.update({
             "tech_score": tech_score,
             "tech_reasons": " / ".join(tech_reasons),
@@ -690,6 +804,9 @@ def analyze(stock_df, sentiment_df=None, config=None):
             "mom_reasons": " / ".join(mom_reasons),
             "total_score": total,
             "signal": signal,
+            "risk_count": risk_count,
+            "risk_labels": risk_labels,
+            "risk_actions": risk_actions,
             "analysis_comment": analysis_comment,
             "analysis_time": datetime.now().isoformat(),
         })

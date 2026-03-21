@@ -197,38 +197,106 @@ def page_dashboard():
     # --- 分析データ読み込み + 重み再計算 ---
     analysis_df = recalculate_scores(load_analysis())
 
-    # --- 買いシグナル TOP10 ---
-    if analysis_df is not None and not analysis_df.empty:
-        st.subheader("買いシグナル TOP10")
-        buy_df = analysis_df[analysis_df["signal"].str.contains("買い", na=False)].copy()
-        buy_df = buy_df.sort_values("total_score", ascending=False).head(10)
-
-        if not buy_df.empty:
-            rows_list = [buy_df.iloc[i:i+5] for i in range(0, len(buy_df), 5)]
-            for chunk in rows_list:
-                cols = st.columns(5)
-                for col, (_, r) in zip(cols, chunk.iterrows()):
-                    with col:
-                        st.markdown(f"**{r['ticker']}**")
-                        st.caption(r.get("name", ""))
-                        score = r.get("total_score", 0)
-                        signal = r.get("signal", "")
-                        st.markdown(f"スコア: **{score:.1f}** / {signal}")
-        else:
-            st.info("現在、買いシグナルの銘柄はありません。")
-
-        # --- 全銘柄ランキング ---
-        st.subheader("全銘柄ランキング")
-        display_cols = ["ticker", "name", "signal", "total_score", "price",
-                        "change_pct", "rsi_14", "vol_ratio", "pos_52w_pct"]
-        available = [c for c in display_cols if c in analysis_df.columns]
-        st.dataframe(
-            analysis_df[available].sort_values("total_score", ascending=False),
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
+    if analysis_df is None or analysis_df.empty:
         st.warning("分析データ (data/latest_analysis.csv) が見つかりません。先に `python run.py` を実行してください。")
+        return
+
+    # --- リスクアラート ---
+    if "risk_count" in analysis_df.columns:
+        risk_df = analysis_df[analysis_df["risk_count"] > 0].copy()
+        if not risk_df.empty:
+            st.subheader("⚠️ リスクアラート")
+            for _, r in risk_df.iterrows():
+                ticker = r["ticker"]
+                name = r.get("name", "")
+                risk_labels = r.get("risk_labels", "")
+                risk_actions = r.get("risk_actions", "")
+                risk_count = int(r["risk_count"])
+                penalty = -20 if risk_count >= 2 else -10
+
+                labels_list = [l.strip() for l in risk_labels.split("/") if l.strip()]
+                actions_list = [a.strip() for a in risk_actions.split("/") if a.strip()]
+
+                with st.expander(f"⚠️ {ticker} ({name}) - {risk_count}件のリスク [{penalty:+d}pt減点]"):
+                    for i, label in enumerate(labels_list):
+                        action = actions_list[i] if i < len(actions_list) else ""
+                        st.markdown(f"**{label}**")
+                        if action:
+                            st.caption(f"推奨: {action}")
+            st.markdown("---")
+
+    # --- 買いシグナル TOP10 ---
+    st.subheader("買いシグナル TOP10")
+    buy_df = analysis_df[analysis_df["signal"].str.contains("買い", na=False)].copy()
+    buy_df = buy_df.sort_values("total_score", ascending=False).head(10)
+
+    if not buy_df.empty:
+        rows_list = [buy_df.iloc[i:i+5] for i in range(0, len(buy_df), 5)]
+        for chunk in rows_list:
+            cols = st.columns(5)
+            for col, (_, r) in zip(cols, chunk.iterrows()):
+                with col:
+                    risk_icon = " ⚠️" if r.get("risk_count", 0) > 0 else ""
+                    st.markdown(f"**{r['ticker']}{risk_icon}**")
+                    st.caption(r.get("name", ""))
+                    score = r.get("total_score", 0)
+                    signal = r.get("signal", "")
+                    st.markdown(f"スコア: **{score:.1f}** / {signal}")
+    else:
+        st.info("現在、買いシグナルの銘柄はありません。")
+
+    # --- TOP3銘柄の1ヶ月後予測 ---
+    st.subheader("TOP3銘柄の1ヶ月後予測")
+    investment = st.number_input(
+        "投資金額 (円)", min_value=10000, value=1000000, step=100000,
+        key="dashboard_investment",
+    )
+
+    top3 = analysis_df.head(3)
+    pred_cols = st.columns(3)
+    for col, (_, r) in zip(pred_cols, top3.iterrows()):
+        ticker = r["ticker"]
+        name = r.get("name", "")
+        risk_icon = " ⚠️" if r.get("risk_count", 0) > 0 else ""
+        with col:
+            st.markdown(f"**{ticker}{risk_icon}** ({name})")
+            try:
+                from predictor import predict_stock
+                result = predict_stock(ticker, periods=[30])
+                if result and result["predictions"]:
+                    pred = result["predictions"][0]
+                    current = result["current_price"]
+                    predicted = pred["predicted_price"]
+                    ret_pct = pred["return_pct"]
+                    pnl = investment * ret_pct / 100
+                    color = "green" if ret_pct >= 0 else "red"
+                    st.metric("現在株価", f"{current:,.2f}")
+                    st.metric("1ヶ月後予測", f"{predicted:,.2f}", f"{ret_pct:+.2f}%")
+                    st.markdown(
+                        f"予想損益: <span style='color:{color}'>¥{pnl:+,.0f}</span>",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(f"信頼区間: {pred['lower_bound']:,.2f} - {pred['upper_bound']:,.2f}")
+                else:
+                    st.warning("予測データ取得不可")
+            except Exception as e:
+                st.warning(f"予測失敗: {e}")
+
+    st.caption(
+        "※ 予測は過去データに基づく統計的推定であり、将来の株価を保証するものではありません。"
+    )
+
+    # --- 全銘柄ランキング ---
+    st.subheader("全銘柄ランキング")
+    display_cols = ["ticker", "name", "signal", "total_score", "price",
+                    "change_pct", "rsi_14", "vol_ratio", "pos_52w_pct",
+                    "risk_count", "risk_labels"]
+    available = [c for c in display_cols if c in analysis_df.columns]
+    st.dataframe(
+        analysis_df[available].sort_values("total_score", ascending=False),
+        width="stretch",
+        hide_index=True,
+    )
 
 
 # ──────────────────────────────────────────────
@@ -528,7 +596,7 @@ def page_portfolio():
 
     # 保有一覧
     st.subheader("保有一覧")
-    st.dataframe(port_df, use_container_width=True, hide_index=True)
+    st.dataframe(port_df, width="stretch", hide_index=True)
 
     # 円グラフ
     st.subheader("ポートフォリオ構成")
@@ -588,7 +656,7 @@ def page_screening():
     available = [c for c in display_cols if c in filtered.columns]
     st.dataframe(
         filtered[available].sort_values("total_score", ascending=False),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
