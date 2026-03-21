@@ -41,24 +41,27 @@ def load_ohlc_dynamic(ticker, period="1y", interval="1d"):
         pass
     return pd.DataFrame()
 
-@st.cache_data(ttl=600)
-def get_prediction_for_ranking(ticker):
-    try:
-        from predictor import predict_stock
-        result = predict_stock(ticker, periods=[1, 7, 30, 90, 180])
-        if result and result["predictions"]:
-            out = {}
-            for pred in result["predictions"]:
-                d = pred["period_days"]
-                out[f"p{d}"] = pred["return_pct"]
-                out[f"p{d}_l80"] = pred["lower_80_pct"]
-                out[f"p{d}_u80"] = pred["upper_80_pct"]
-                out[f"p{d}_l95"] = pred["lower_95_pct"]
-                out[f"p{d}_u95"] = pred["upper_95_pct"]
-            return out
-    except Exception:
-        pass
-    return {}
+@st.cache_data(ttl=300)
+def load_predictions():
+    p = DATA_DIR / "latest_predictions.csv"
+    return pd.read_csv(p, encoding="utf-8-sig") if p.exists() else None
+
+def get_prediction_for_ticker(ticker, pred_df):
+    """予測CSVから該当銘柄の予測データを取得"""
+    if pred_df is None:
+        return {}
+    row = pred_df[pred_df["ticker"] == ticker]
+    if row.empty:
+        return {}
+    r = row.iloc[0]
+    out = {}
+    for d in [1, 7, 30, 90, 180]:
+        pct = r.get(f"pred_{d}d_pct")
+        if pd.notna(pct):
+            out[f"p{d}"] = float(pct)
+            out[f"p{d}_l80"] = float(r.get(f"pred_{d}d_l80", 0))
+            out[f"p{d}_u80"] = float(r.get(f"pred_{d}d_u80", 0))
+    return out
 
 def compute_rsi(series, period=14):
     delta = series.diff()
@@ -100,7 +103,7 @@ def short_signal(s):
     return "様子見"
 
 def short_risk(labels, count):
-    if pd.isna(count) or int(count) == 0: return "✅"
+    if pd.isna(count) or int(count) == 0: return "-"
     rc = int(count)
     if rc >= 2: return f"🔴要注意({rc}件)"
     m = {"急落アラート":"⚠️急落","高ボラティリティ警告":"⚠️高ボラ",
@@ -177,57 +180,61 @@ def page_dashboard():
     # --- 全銘柄ランキング ---
     st.subheader("全銘柄ランキング")
     st.caption("📊 予測精度の目安: 1日後は高精度 → 6ヶ月後は参考程度（期間が長いほどブレが大きくなります）")
+    st.caption("前日比: 前営業日の終値からの変動率 | 予測: 本日の終値を起点にした予測変動率")
     pred_headers = {
-        1: "1日後",
-        7: "1週後",
-        30: "1月後",
-        90: "3月後",
-        180: "6月後",
+        1: ("1日後(80%)", "予測した騰落の方向(上がるor下がる)が当たる確率が約80%"),
+        7: ("1週後(75%)", "1週間後の方向予測。当たる確率は約75%"),
+        30: ("1月後(65%)", "1ヶ月後の方向予測。決算や材料で変動の可能性あり。約65%"),
+        90: ("3月後(50%)", "3ヶ月後の予測は不確実。方向が当たる確率は約50%"),
+        180: ("6月後(40%)", "半年後の予測は不確実。方向が当たる確率は約40%程度"),
     }
 
-    with st.spinner("予測データを取得中..."):
-        rows = []
-        for _, r in analysis_df.sort_values("total_score", ascending=False).iterrows():
-            tk = r["ticker"]
-            name = r.get("name", "")
-            market = r.get("market", "US")
-            preds = get_prediction_for_ranking(tk)
+    pred_df = load_predictions()
+    rows = []
+    for _, r in analysis_df.sort_values("total_score", ascending=False).iterrows():
+        tk = r["ticker"]
+        name = r.get("name", "")
+        market = r.get("market", "US")
+        preds = get_prediction_for_ticker(tk, pred_df)
 
-            # Google検索リンク生成
-            if market == "JP" or tk.endswith(".T"):
-                search_url = f"https://www.google.com/search?q={name}+株価"
+        # Google検索リンク生成
+        if market == "JP" or tk.endswith(".T"):
+            search_url = f"https://www.google.com/search?q={name}+株価"
+        else:
+            search_url = f"https://www.google.com/search?q={tk}+stock+price"
+
+        rd = {
+            "銘柄": tk,
+            "名前": {"text": name, "url": search_url},
+            "シグナル": short_signal(r.get("signal","")),
+            "スコア": r.get("total_score",0),
+            "株価": r.get("price",0),
+            "前日比(%)": r.get("change_pct",0),
+        }
+        for days, (hdr, _) in pred_headers.items():
+            pct = preds.get(f"p{days}")
+            l80 = preds.get(f"p{days}_l80")
+            u80 = preds.get(f"p{days}_u80")
+            if pct is not None:
+                rd[hdr] = {"pct": pct, "l80": l80, "u80": u80}
             else:
-                search_url = f"https://www.google.com/search?q={tk}+stock+price"
+                rd[hdr] = None
+        rd["出来高比率"] = fmt_vol(r.get("vol_ratio"), r.get("volume"))
+        rd["RSI"] = round(r.get("rsi_14",0),1) if pd.notna(r.get("rsi_14")) else "-"
+        rd["52週位置"] = f"{r.get('pos_52w_pct',0):.0f}%" if pd.notna(r.get("pos_52w_pct")) else "-"
+        rd["リスク"] = short_risk(r.get("risk_labels",""), r.get("risk_count",0))
+        rows.append(rd)
 
-            rd = {
-                "銘柄": tk,
-                "名前": {"text": name, "url": search_url},
-                "シグナル": short_signal(r.get("signal","")),
-                "スコア": r.get("total_score",0),
-                "株価": r.get("price",0),
-                "騰落率": r.get("change_pct",0),
-            }
-            for days, hdr in pred_headers.items():
-                pct = preds.get(f"p{days}")
-                l80 = preds.get(f"p{days}_l80")
-                u80 = preds.get(f"p{days}_u80")
-                if pct is not None:
-                    rd[hdr] = {"pct": pct, "l80": l80, "u80": u80}
-                else:
-                    rd[hdr] = None
-            rd["出来高比率"] = fmt_vol(r.get("vol_ratio"), r.get("volume"))
-            rd["RSI"] = round(r.get("rsi_14",0),1) if pd.notna(r.get("rsi_14")) else "-"
-            rd["52週位置"] = f"{r.get('pos_52w_pct',0):.0f}%" if pd.notna(r.get("pos_52w_pct")) else "-"
-            rd["リスク"] = short_risk(r.get("risk_labels",""), r.get("risk_count",0))
-            rows.append(rd)
-
-    pred_col_names = list(pred_headers.values())
-    all_cols = ["銘柄","名前","シグナル","スコア","株価","騰落率"] + pred_col_names + ["出来高比率","RSI","52週位置","リスク"]
+    pred_col_names = [h for _, (h, _) in pred_headers.items()]
+    header_tips = {h: tip for _, (h, tip) in pred_headers.items()}
+    all_cols = ["銘柄","名前","シグナル","スコア","株価","前日比(%)"] + pred_col_names + ["出来高比率","RSI","52週位置","リスク"]
 
     html = '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">'
     html += '<thead><tr style="background:#1a1a2e;color:white">'
     for c in all_cols:
-        html += f'<th style="padding:5px 6px;white-space:nowrap">{c}</th>'
+        tip = header_tips.get(c, "")
+        ta = f' title="{tip}"' if tip else ""
+        html += f'<th style="padding:5px 6px;white-space:nowrap;cursor:help"{ta}>{c}</th>'
     html += '</tr></thead><tbody>'
 
     for rd in rows:
@@ -261,7 +268,7 @@ def page_dashboard():
                     cell = f'<span style="color:{color};font-weight:{fw}">{pct:+.1f}%</span>'
                     tip = f"予測: {pct:+.1f}% | この予測が当たる範囲: 80%の確率で{l80:+.1f}%~{u80:+.1f}%" if l80 is not None else ""
                     html += f'<td style="{style}" title="{tip}">{cell}</td>'
-            elif c == "騰落率":
+            elif c == "前日比(%)":
                 try:
                     v = float(val)
                     color = "green" if v >= 0 else "red"

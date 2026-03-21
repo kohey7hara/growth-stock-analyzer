@@ -137,6 +137,28 @@ def main():
             import traceback
             traceback.print_exc()
 
+    # Step 4.5: 全銘柄予測
+    if run_analyze:
+        logger.info("\n[Step 4.5/6] 全銘柄予測データ生成中...")
+        try:
+            import pandas as pd
+            from predictor import predict_all_stocks
+            data_dir = BASE_DIR / "data"
+            if analysis_df is None:
+                ap = data_dir / "latest_analysis.csv"
+                if ap.exists():
+                    analysis_df = pd.read_csv(ap)
+            if analysis_df is not None:
+                tickers = analysis_df["ticker"].tolist()
+                pred_df = predict_all_stocks(tickers)
+                logger.info(f"  完了: {len(pred_df)}銘柄の予測データ生成")
+            else:
+                logger.warning("  分析データなし: 予測スキップ")
+        except Exception as e:
+            logger.warning(f"  予測データ生成スキップ: {e}")
+            import traceback
+            traceback.print_exc()
+
     # Step 5: ポートフォリオ分析
     if run_report:
         logger.info("\n[Step 5/6] ポートフォリオ分析中...")
