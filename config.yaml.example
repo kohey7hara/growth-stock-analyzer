@@ -1,0 +1,171 @@
+# ============================================================
+# Growth Stock Analyzer - 設定ファイル (テンプレート)
+# ============================================================
+# このファイルを config.yaml にコピーして使用してください:
+#   cp config.yaml.example config.yaml
+
+# --- API Keys ---
+# 各APIの無料プランでの制限:
+#   Alpha Vantage: 25リクエスト/日 (無料), $49.99/月で無制限
+#   Reddit: 100リクエスト/分 (OAuth, 無料)
+#   X (Twitter): $100/月 (Basic), $5,000/月 (Pro)
+#   Google Trends: 無料 (レート制限あり)
+
+api_keys:
+  alpha_vantage: "YOUR_ALPHA_VANTAGE_KEY"    # https://www.alphavantage.co/support/#api-key で無料取得
+  reddit_client_id: "YOUR_REDDIT_CLIENT_ID"   # https://www.reddit.com/prefs/apps で作成
+  reddit_client_secret: "YOUR_REDDIT_SECRET"
+  reddit_user_agent: "GrowthStockAnalyzer/1.0"
+  twitter_bearer_token: "YOUR_TWITTER_BEARER_TOKEN"  # https://developer.x.com/
+
+# --- 分析対象銘柄 ---
+# ticker: Yahoo Financeのティッカーシンボル
+# name: 表示名
+# sector: セクター分類
+# market: us or jp
+
+watchlist:
+  us_stocks:
+    # --- 半導体/AI (既存) ---
+    - { ticker: "NVDA",  name: "NVIDIA",           sector: "半導体/AI" }
+    - { ticker: "AMD",   name: "AMD",              sector: "半導体/AI" }
+    - { ticker: "AVGO",  name: "Broadcom",         sector: "半導体/AI" }
+    # --- 半導体 (追加) ---
+    - { ticker: "MRVL",  name: "Marvell Technology", sector: "半導体" }
+    - { ticker: "LRCX",  name: "Lam Research",      sector: "半導体製造装置" }
+    - { ticker: "KLAC",  name: "KLA Corporation",    sector: "半導体検査装置" }
+    - { ticker: "AMAT",  name: "Applied Materials",  sector: "半導体製造装置" }
+    - { ticker: "CDNS",  name: "Cadence Design",     sector: "半導体EDA" }
+    - { ticker: "SNPS",  name: "Synopsys",           sector: "半導体EDA" }
+    - { ticker: "TSM",   name: "TSMC",               sector: "半導体ファウンドリ" }
+    - { ticker: "INTC",  name: "Intel",              sector: "半導体" }
+    - { ticker: "QCOM",  name: "Qualcomm",           sector: "半導体/通信" }
+    - { ticker: "MU",    name: "Micron Technology",   sector: "半導体/メモリ" }
+    # --- テック/広告/AI (既存) ---
+    - { ticker: "META",  name: "Meta Platforms",    sector: "テック/広告" }
+    - { ticker: "PLTR",  name: "Palantir",         sector: "AI/ソフトウェア" }
+    - { ticker: "MSFT",  name: "Microsoft",        sector: "テック/クラウド" }
+    - { ticker: "AAPL",  name: "Apple",            sector: "テック/消費者" }
+    - { ticker: "AMZN",  name: "Amazon",           sector: "テック/EC/クラウド" }
+    - { ticker: "GOOGL", name: "Alphabet",         sector: "テック/広告/AI" }
+    - { ticker: "TSLA",  name: "Tesla",            sector: "EV/AI/エネルギー" }
+    # --- AI/クラウド (追加) ---
+    - { ticker: "CRM",   name: "Salesforce",        sector: "クラウド/SaaS" }
+    - { ticker: "NOW",   name: "ServiceNow",        sector: "クラウド/SaaS" }
+    - { ticker: "SNOW",  name: "Snowflake",          sector: "クラウド/データ" }
+    - { ticker: "DDOG",  name: "Datadog",            sector: "クラウド/監視" }
+    - { ticker: "NET",   name: "Cloudflare",         sector: "クラウド/セキュリティ" }
+    - { ticker: "CRWD",  name: "CrowdStrike",        sector: "サイバーセキュリティ" }
+    - { ticker: "ZS",    name: "Zscaler",            sector: "サイバーセキュリティ" }
+    - { ticker: "PANW",  name: "Palo Alto Networks", sector: "サイバーセキュリティ" }
+    # --- EC/消費 (追加) ---
+    - { ticker: "SHOP",  name: "Shopify",            sector: "EC/SaaS" }
+    - { ticker: "UBER",  name: "Uber Technologies",  sector: "モビリティ" }
+    - { ticker: "ABNB",  name: "Airbnb",             sector: "旅行/プラットフォーム" }
+    - { ticker: "XYZ",   name: "Block (Square)",     sector: "フィンテック" }
+    - { ticker: "COIN",  name: "Coinbase",           sector: "暗号資産" }
+    # --- ヘルスケア (追加) ---
+    - { ticker: "LLY",   name: "Eli Lilly",          sector: "ヘルスケア/製薬" }
+    - { ticker: "NVO",   name: "Novo Nordisk",       sector: "ヘルスケア/製薬" }
+    - { ticker: "ISRG",  name: "Intuitive Surgical", sector: "ヘルスケア/ロボット" }
+    - { ticker: "DXCM",  name: "DexCom",             sector: "ヘルスケア/医療機器" }
+    # --- その他成長株 (追加) ---
+    - { ticker: "NFLX",  name: "Netflix",            sector: "エンタメ/ストリーミング" }
+    - { ticker: "V",     name: "Visa",               sector: "フィンテック/決済" }
+    - { ticker: "MA",    name: "Mastercard",          sector: "フィンテック/決済" }
+    # --- AI/サーバー (追加) ---
+    - { ticker: "SMCI",  name: "Super Micro Computer", sector: "サーバー/AI" }
+    - { ticker: "ARM",   name: "Arm Holdings",         sector: "半導体/IP" }
+    - { ticker: "DELL",  name: "Dell Technologies",    sector: "サーバー/PC" }
+    - { ticker: "HPE",   name: "Hewlett Packard Enterprise", sector: "サーバー/ネットワーク" }
+    - { ticker: "ORCL",  name: "Oracle",               sector: "クラウド/DB" }
+    - { ticker: "IBM",   name: "IBM",                  sector: "AI/コンサルティング" }
+    - { ticker: "ADBE",  name: "Adobe",                sector: "クリエイティブ/SaaS" }
+
+  us_etfs:
+    - { ticker: "VOO",  name: "Vanguard S&P 500",       sector: "指数ETF" }
+    - { ticker: "QQQ",  name: "Invesco NASDAQ 100",     sector: "指数ETF" }
+    - { ticker: "SOXX", name: "iShares Semiconductor",  sector: "半導体ETF" }
+    - { ticker: "ARKK", name: "ARK Innovation",         sector: "イノベーションETF" }
+    - { ticker: "XLF",  name: "Financial Select SPDR",  sector: "金融ETF" }
+    - { ticker: "XLE",  name: "Energy Select SPDR",     sector: "エネルギーETF" }
+    - { ticker: "XLV",  name: "Health Care Select SPDR", sector: "ヘルスケアETF" }
+
+  jp_stocks:
+    # --- 半導体製造装置 (既存) ---
+    - { ticker: "8035.T",  name: "東京エレクトロン",  sector: "半導体製造装置" }
+    - { ticker: "6920.T",  name: "レーザーテック",    sector: "半導体検査装置" }
+    - { ticker: "6146.T",  name: "ディスコ",         sector: "半導体製造装置" }
+    - { ticker: "6857.T",  name: "アドバンテスト",    sector: "半導体テスト装置" }
+    - { ticker: "6526.T",  name: "ソシオネクスト",    sector: "SoC設計" }
+    - { ticker: "7011.T",  name: "三菱重工業",       sector: "防衛/エネルギー" }
+    - { ticker: "6861.T",  name: "キーエンス",       sector: "FA/センサー" }
+    # --- 半導体関連 (追加) ---
+    - { ticker: "4063.T",  name: "信越化学工業",     sector: "半導体材料" }
+    - { ticker: "6963.T",  name: "ローム",           sector: "半導体/電子部品" }
+    - { ticker: "6723.T",  name: "ルネサスエレクトロニクス", sector: "半導体/マイコン" }
+    # --- テック (追加) ---
+    - { ticker: "9984.T",  name: "ソフトバンクグループ", sector: "投資/テック" }
+    - { ticker: "4661.T",  name: "オリエンタルランド",   sector: "レジャー/テーマパーク" }
+    - { ticker: "6098.T",  name: "リクルートHD",       sector: "人材/テック" }
+    # --- 商社 (追加) ---
+    - { ticker: "8058.T",  name: "三菱商事",         sector: "総合商社" }
+    - { ticker: "8031.T",  name: "三井物産",         sector: "総合商社" }
+    - { ticker: "8001.T",  name: "伊藤忠商事",       sector: "総合商社" }
+    # --- 金融 (追加) ---
+    - { ticker: "8306.T",  name: "三菱UFJ FG",       sector: "メガバンク" }
+    - { ticker: "8316.T",  name: "三井住友FG",       sector: "メガバンク" }
+    # --- その他成長 (追加) ---
+    - { ticker: "6367.T",  name: "ダイキン工業",     sector: "空調/機械" }
+    - { ticker: "7974.T",  name: "任天堂",           sector: "ゲーム/エンタメ" }
+    - { ticker: "9983.T",  name: "ファーストリテイリング", sector: "小売/アパレル" }
+    - { ticker: "6501.T",  name: "日立製作所",       sector: "総合電機/IT" }
+    - { ticker: "6758.T",  name: "ソニーグループ",    sector: "エンタメ/半導体" }
+    - { ticker: "4568.T",  name: "第一三共",         sector: "製薬" }
+    # --- ヘルスケアIT/通信/ゲーム (追加) ---
+    - { ticker: "2413.T",  name: "エムスリー",       sector: "ヘルスケアIT" }
+    - { ticker: "4385.T",  name: "メルカリ",         sector: "EC/フリマ" }
+    - { ticker: "3659.T",  name: "ネクソン",         sector: "ゲーム" }
+    - { ticker: "6594.T",  name: "日本電産",         sector: "モーター/EV部品" }
+    - { ticker: "9432.T",  name: "NTT",             sector: "通信" }
+    - { ticker: "9433.T",  name: "KDDI",            sector: "通信" }
+
+# --- テクニカル分析パラメータ ---
+technical:
+  sma_short: 20       # 短期移動平均 (日)
+  sma_long: 50        # 長期移動平均 (日)
+  sma_trend: 200      # トレンド移動平均 (日)
+  rsi_period: 14      # RSI期間
+  rsi_oversold: 30    # RSI 売られすぎ閾値
+  rsi_overbought: 70  # RSI 買われすぎ閾値
+  macd_fast: 12       # MACD 短期
+  macd_slow: 26       # MACD 長期
+  macd_signal: 9      # MACD シグナル
+  bb_period: 20       # ボリンジャーバンド期間
+  bb_std: 2           # ボリンジャーバンド標準偏差
+
+# --- SNSセンチメント設定 ---
+sentiment:
+  google_trends_period: "3m"       # 過去3ヶ月
+  reddit_subreddits:
+    - "wallstreetbets"
+    - "stocks"
+    - "investing"
+    - "options"
+  reddit_lookback_days: 7          # 過去7日間のメンション数を取得
+  twitter_lookback_hours: 24       # 過去24時間のツイート数
+
+# --- スコアリング重み ---
+scoring:
+  weights:
+    technical_score: 0.35     # テクニカル分析 (35%)
+    fundamental_score: 0.30   # ファンダメンタルズ (30%)
+    sentiment_score: 0.20     # SNSセンチメント (20%)
+    momentum_score: 0.15      # モメンタム/出来高 (15%)
+
+# --- 出力設定 ---
+output:
+  excel_path: "output/growth_stock_report.xlsx"
+  csv_path: "data/latest_data.csv"
+  history_path: "data/history/"
+  log_path: "logs/analyzer.log"

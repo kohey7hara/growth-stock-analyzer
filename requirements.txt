@@ -1,0 +1,26 @@
+# Growth Stock Analyzer - 必要パッケージ
+# pip install -r requirements.txt
+
+# === 必須 ===
+yfinance>=0.2.36          # Yahoo Finance 株価データ取得
+pandas>=2.0               # データ処理
+openpyxl>=3.1             # Excel出力
+pyyaml>=6.0               # 設定ファイル読込
+requests>=2.31            # HTTP通信
+numpy>=1.24               # 数値計算
+
+# === SNSデータ取得 (オプション) ===
+pytrends>=4.9             # Google Trends
+praw>=7.7                 # Reddit API
+tweepy>=4.14              # X (Twitter) API  ※有料プラン必要
+
+# === ダッシュボード ===
+streamlit>=1.32           # Webダッシュボード
+plotly>=5.18              # インタラクティブチャート
+
+# === 株価予測 (オプション) ===
+prophet>=1.1              # Facebook Prophet (推奨)
+statsmodels>=0.14         # ARIMA フォールバック
+
+# === バックアップAPI (オプション) ===
+alpha-vantage>=2.3        # Alpha Vantage API
