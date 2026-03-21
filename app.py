@@ -174,74 +174,40 @@ def page_dashboard():
         st.warning("分析データが見つかりません。先に `python run.py` を実行してください。")
         return
 
-    # --- 買いシグナル TOP10 ---
-    st.subheader("買いシグナル TOP10")
-    buy_df = analysis_df[analysis_df["signal"].str.contains("買い", na=False)].copy()
-    buy_df = buy_df.sort_values("total_score", ascending=False).head(10)
-    if not buy_df.empty:
-        for chunk in [buy_df.iloc[i:i+5] for i in range(0, len(buy_df), 5)]:
-            cols = st.columns(5)
-            for col, (_, r) in zip(cols, chunk.iterrows()):
-                with col:
-                    ri = " ⚠️" if r.get("risk_count", 0) > 0 else ""
-                    st.markdown(f"**{r['ticker']}{ri}**")
-                    st.caption(r.get("name",""))
-                    st.markdown(f"スコア: **{r.get('total_score',0):.1f}** / {short_signal(r.get('signal',''))}")
-    else:
-        st.info("現在、買いシグナルの銘柄はありません。")
-
-    # --- TOP3 1ヶ月後予測 ---
-    st.subheader("TOP3銘柄の1ヶ月後予測")
-    investment = st.number_input("投資金額 (円)", min_value=10000, value=1000000, step=100000, key="inv")
-    st.caption(f"投資金額: ¥{investment:,.0f}")
-    top3 = analysis_df.head(3)
-    pcols = st.columns(3)
-    for col, (_, r) in zip(pcols, top3.iterrows()):
-        tk = r["ticker"]
-        ri = " ⚠️" if r.get("risk_count",0) > 0 else ""
-        with col:
-            st.markdown(f"**{tk}{ri}** ({r.get('name','')})")
-            try:
-                from predictor import predict_stock
-                res = predict_stock(tk, periods=[30])
-                if res and res["predictions"]:
-                    p = res["predictions"][0]
-                    cur = res["current_price"]
-                    ret = p["return_pct"]
-                    pnl = investment * ret / 100
-                    c = "green" if ret >= 0 else "red"
-                    st.metric("現在株価", f"{cur:,.2f}")
-                    st.metric("1ヶ月後予測", f"{p['predicted_price']:,.2f}", f"{ret:+.2f}%")
-                    st.markdown(f"予想損益: <span style='color:{c}'>¥{pnl:+,.0f}</span>", unsafe_allow_html=True)
-                    st.caption(f"80%確率: {p['lower_80']:,.0f}~{p['upper_80']:,.0f} | 95%確率: {p['lower_95']:,.0f}~{p['upper_95']:,.0f}")
-                else:
-                    st.warning("予測取得不可")
-            except Exception as e:
-                st.warning(f"予測失敗: {e}")
-
     # --- 全銘柄ランキング ---
     st.subheader("全銘柄ランキング")
+    st.caption("📊 予測精度の目安: 1日後は高精度 → 6ヶ月後は参考程度（期間が長いほどブレが大きくなります）")
     pred_headers = {
-        1: ("1日後(±3%)", "短期トレンドの延長。精度が比較的高い(±3%)"),
-        7: ("1週後(±5%)", "数日間のトレンド予測。決算前後で大きく外れる可能性あり(±5%)"),
-        30: ("1月後(±10%)", "テクニカルトレンドベース。決算や材料で変動の可能性あり(±10%)"),
-        90: ("3月後(±15%)", "中期トレンドの推計。不確実性がやや高い(±15%)"),
-        180: ("6月後(±20%)", "長期トレンドの推計。不確実性が高い(±20%)ため参考程度に"),
+        1: "1日後",
+        7: "1週後",
+        30: "1月後",
+        90: "3月後",
+        180: "6月後",
     }
 
     with st.spinner("予測データを取得中..."):
         rows = []
         for _, r in analysis_df.sort_values("total_score", ascending=False).iterrows():
             tk = r["ticker"]
+            name = r.get("name", "")
+            market = r.get("market", "US")
             preds = get_prediction_for_ranking(tk)
+
+            # Google検索リンク生成
+            if market == "JP" or tk.endswith(".T"):
+                search_url = f"https://www.google.com/search?q={name}+株価"
+            else:
+                search_url = f"https://www.google.com/search?q={tk}+stock+price"
+
             rd = {
-                "銘柄": tk, "名前": r.get("name",""),
+                "銘柄": tk,
+                "名前": {"text": name, "url": search_url},
                 "シグナル": short_signal(r.get("signal","")),
                 "スコア": r.get("total_score",0),
                 "株価": r.get("price",0),
                 "騰落率": r.get("change_pct",0),
             }
-            for days, (hdr, _) in pred_headers.items():
+            for days, hdr in pred_headers.items():
                 pct = preds.get(f"p{days}")
                 l80 = preds.get(f"p{days}_l80")
                 u80 = preds.get(f"p{days}_u80")
@@ -255,21 +221,13 @@ def page_dashboard():
             rd["リスク"] = short_risk(r.get("risk_labels",""), r.get("risk_count",0))
             rows.append(rd)
 
-    # HTML表生成
-    pred_col_names = [h for _, (h, _) in pred_headers.items()]
+    pred_col_names = list(pred_headers.values())
     all_cols = ["銘柄","名前","シグナル","スコア","株価","騰落率"] + pred_col_names + ["出来高比率","RSI","52週位置","リスク"]
-
-    # ヘッダーtooltip
-    header_tips = {}
-    for days, (hdr, tip) in pred_headers.items():
-        header_tips[hdr] = tip
 
     html = '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">'
     html += '<thead><tr style="background:#1a1a2e;color:white">'
     for c in all_cols:
-        tip = header_tips.get(c, "")
-        title_attr = f' title="{tip}"' if tip else ""
-        html += f'<th style="padding:5px 6px;white-space:nowrap;cursor:help"{title_attr}>{c}</th>'
+        html += f'<th style="padding:5px 6px;white-space:nowrap">{c}</th>'
     html += '</tr></thead><tbody>'
 
     for rd in rows:
@@ -280,27 +238,29 @@ def page_dashboard():
         for c in all_cols:
             val = rd.get(c, "-")
             style = "padding:4px 6px;white-space:nowrap;"
-            if c in pred_col_names:
+            if c == "名前":
+                if isinstance(val, dict):
+                    url = val["url"]
+                    text = val["text"]
+                    html += f'<td style="{style}"><a href="{url}" target="_blank" style="color:inherit;text-decoration:none">{text} 🔗</a></td>'
+                else:
+                    html += f'<td style="{style}">{val}</td>'
+            elif c in pred_col_names:
                 if val is None:
-                    cell = "-"
-                    title = ""
+                    html += f'<td style="{style}">-</td>'
                 else:
                     pct = val["pct"]
                     l80 = val.get("l80")
                     u80 = val.get("u80")
-                    # 色分け: 80%下限もプラス→濃い緑、予測プラスだが下限マイナス→薄い緑、マイナス→赤
                     if l80 is not None and l80 > 0:
-                        color = "#006400"  # 濃い緑
-                        fw = "bold"
+                        color, fw = "#006400", "bold"
                     elif pct >= 0:
-                        color = "#228B22"  # 薄い緑
-                        fw = "normal"
+                        color, fw = "#228B22", "normal"
                     else:
-                        color = "red"
-                        fw = "normal"
+                        color, fw = "red", "normal"
                     cell = f'<span style="color:{color};font-weight:{fw}">{pct:+.1f}%</span>'
-                    title = f"80%確率: {l80:+.1f}%~{u80:+.1f}%" if l80 is not None else ""
-                html += f'<td style="{style}" title="{title}">{cell}</td>'
+                    tip = f"予測: {pct:+.1f}% | この予測が当たる範囲: 80%の確率で{l80:+.1f}%~{u80:+.1f}%" if l80 is not None else ""
+                    html += f'<td style="{style}" title="{tip}">{cell}</td>'
             elif c == "騰落率":
                 try:
                     v = float(val)
@@ -324,7 +284,7 @@ def page_dashboard():
     html += '</tbody></table></div>'
 
     st.markdown(html, unsafe_allow_html=True)
-    st.caption("予測カラムにマウスを合わせると80%信頼区間が表示されます。"
+    st.caption("予測カラムにマウスを合わせると信頼区間が表示されます。"
                "80%確率=10回中8回はこの範囲に収まる見込み。")
 
 
@@ -344,8 +304,9 @@ def page_detail():
         st.warning("分析データがありません。先に `python run.py` を実行してください。")
         return
 
-    tickers = analysis_df["ticker"].tolist()
-    selected = st.sidebar.selectbox("銘柄を選択", tickers)
+    options = [f"{r['ticker']} - {r['name']}" for _, r in analysis_df.iterrows()]
+    selected_opt = st.sidebar.selectbox("銘柄を選択", options)
+    selected = selected_opt.split(" - ")[0]
     row = analysis_df[analysis_df["ticker"]==selected].iloc[0]
     ri = " ⚠️" if row.get("risk_count",0) > 0 else ""
     st.subheader(f"{selected}{ri} - {row.get('name','')}")
@@ -540,7 +501,9 @@ def page_prediction():
     if df is None or df.empty:
         st.warning("分析データがありません。")
         return
-    selected = st.selectbox("銘柄を選択", df["ticker"].tolist())
+    options = [f"{r['ticker']} - {r['name']}" for _, r in df.iterrows()]
+    selected_opt = st.selectbox("銘柄を選択", options)
+    selected = selected_opt.split(" - ")[0]
     investment = st.number_input("投資金額 (円)", min_value=10000, value=1000000, step=100000)
     st.caption(f"投資金額: ¥{investment:,.0f}")
 
