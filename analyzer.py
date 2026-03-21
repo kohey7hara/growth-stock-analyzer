@@ -611,12 +611,102 @@ def calculate_macro_score(macro_df=None):
 
     detail_str = " / ".join(details)
 
+    # サマリーコメント生成
+    summary_lines = []
+    indicator_comments = []
+
+    # VIXコメント
+    if not vix_row.empty:
+        vix = vix_row.iloc[0]["current_value"]
+        vix_chg = vix_row.iloc[0].get("change_1d_pct", 0)
+        vix_chg_s = f"({vix_chg:+.1f}%)" if pd.notna(vix_chg) else ""
+        if vix >= 25:
+            indicator_comments.append(
+                f"VIX {vix:.2f}{vix_chg_s} → 投資家の不安感が高まっている。"
+                "買い控えムードが強く、短期的にはボラティリティが高い状態。")
+        elif vix >= 20:
+            indicator_comments.append(
+                f"VIX {vix:.2f}{vix_chg_s} → やや警戒モード。"
+                "市場は不安定だが、パニック的な売りではない。")
+        else:
+            indicator_comments.append(
+                f"VIX {vix:.2f}{vix_chg_s} → 市場は安定。"
+                "リスクオン環境でグロース株に追い風。")
+
+    # S&P500コメント
+    if not gspc_row.empty:
+        gspc = gspc_row.iloc[0]["current_value"]
+        gspc_chg = gspc_row.iloc[0].get("change_1d_pct", 0)
+        gspc_chg_s = f"({gspc_chg:+.1f}%)" if pd.notna(gspc_chg) else ""
+        above_sma = any("SMA200上" in d for d in details)
+        if above_sma:
+            indicator_comments.append(
+                f"S&P500 {gspc:,.0f}{gspc_chg_s} → 米国市場は上昇トレンド。"
+                "200日移動平均線を上回っており、中期トレンドは強い。")
+        else:
+            indicator_comments.append(
+                f"S&P500 {gspc:,.0f}{gspc_chg_s} → 米国市場は調整局面。"
+                "200日移動平均線を下回っており、中期トレンドは弱い。")
+
+    # 日経225コメント
+    if not nk_row.empty:
+        nk = nk_row.iloc[0]["current_value"]
+        nk_chg = nk_row.iloc[0].get("change_1d_pct", 0)
+        nk_chg_s = f"({nk_chg:+.1f}%)" if pd.notna(nk_chg) else ""
+        usdjpy_val = ""
+        if not usdjpy_row.empty:
+            usdjpy_val = f"円安({usdjpy_row.iloc[0]['current_value']:.0f}円)が進行しており輸出関連には追い風。"
+        nk_above = any("日経225がSMA200上" in d for d in details)
+        if nk_above:
+            indicator_comments.append(
+                f"日経225 {nk:,.0f}{nk_chg_s} → 日本市場は堅調。{usdjpy_val}")
+        else:
+            indicator_comments.append(
+                f"日経225 {nk:,.0f}{nk_chg_s} → 日本市場も軟調。{usdjpy_val}")
+
+    # 金利コメント
+    if not tnx_row.empty:
+        tnx = tnx_row.iloc[0]["current_value"]
+        if tnx >= 4.5:
+            indicator_comments.append(
+                f"米10年金利 {tnx:.2f}% → 高金利環境が継続。"
+                "グロース株には逆風だが、バリュー株には影響限定的。")
+        elif tnx >= 3.5:
+            indicator_comments.append(
+                f"米10年金利 {tnx:.2f}% → 金利は中立的な水準。"
+                "個別銘柄のファンダメンタルズ重視の局面。")
+        else:
+            indicator_comments.append(
+                f"米10年金利 {tnx:.2f}% → 金利低下はグロース株に追い風。"
+                "成長株の相対的魅力が向上。")
+
+    # 投資判断サマリー
+    if score >= 80:
+        advice = ("全体的に「攻めの姿勢」が取れる環境。"
+                  "成長株を中心にポジションを増やす好機。")
+    elif score >= 60:
+        advice = ("やや強気の環境。押し目があれば買い増しを検討。"
+                  "ただし一括投資より分割買いが安全。")
+    elif score >= 40:
+        advice = ("今は全体的に「守りの姿勢」が推奨される環境。"
+                  "個別銘柄の押し目を狙うなら、52週安値圏かつRSI30以下の"
+                  "売られすぎ銘柄に絞るのが安全。大型の一括投資より"
+                  "分割買い（ドルコスト平均法）が望ましい。")
+    else:
+        advice = ("市場環境が厳しく、新規買いは控えるべき局面。"
+                  "現金比率を高め、急落後の反発を待つのが賢明。"
+                  "保有銘柄の損切りラインも再確認を。")
+
+    summary = "\n".join(f"・{c}" for c in indicator_comments)
+    summary += f"\n\n【投資判断への示唆】\n{advice}"
+
     return {
         "score": score,
         "label": label,
         "emoji": emoji,
         "detail": detail_str,
         "bonus": bonus,
+        "summary": summary,
     }
 
 
