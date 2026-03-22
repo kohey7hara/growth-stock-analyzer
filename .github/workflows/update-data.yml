@@ -1,0 +1,65 @@
+name: Daily Stock Data Update
+
+on:
+  schedule:
+    # 毎日 UTC 22:00 = 日本時間 翌朝7:00 に実行
+    - cron: '0 22 * * *'
+  workflow_dispatch:  # 手動実行も可能
+
+permissions:
+  contents: write
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install yfinance pandas openpyxl pyyaml requests numpy pytrends statsmodels
+
+      - name: Generate config.yaml from template
+        run: |
+          cp config.yaml.example config.yaml
+          # API keys are optional - sentiment will use fallback methods
+
+      - name: Run data update
+        run: |
+          python run.py 2>&1 | tail -50
+        env:
+          PYTHONUNBUFFERED: "1"
+        continue-on-error: false
+
+      - name: Commit and push updated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Add data files
+          git add data/latest_*.csv
+          git add data/stock_data_*.csv
+          git add data/analysis_result_*.csv
+          git add data/sentiment_data_*.csv
+          git add data/macro_data_*.csv
+          git add data/latest_predictions.csv
+          git add output/ || true
+
+          # Check if there are changes
+          if git diff --staged --quiet; then
+            echo "No data changes to commit"
+          else
+            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+            git commit -m "📊 Auto-update stock data: ${TIMESTAMP}"
+            git push
+          fi

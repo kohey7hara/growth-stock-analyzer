@@ -18,9 +18,6 @@ tweepy>=4.14              # X (Twitter) API  ※有料プラン必要
 streamlit>=1.32           # Webダッシュボード
 plotly>=5.18              # インタラクティブチャート
 
-# === 株価予測 (オプション) ===
-prophet>=1.1              # Facebook Prophet (推奨)
-statsmodels>=0.14         # ARIMA フォールバック
-
-# === バックアップAPI (オプション) ===
-alpha-vantage>=2.3        # Alpha Vantage API
+# === 株価予測 ===
+statsmodels>=0.14         # ETS/ARIMA フォールバック予測
+# prophet>=1.1            # Facebook Prophet (ローカル推奨、クラウドでは重い)
