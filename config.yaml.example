@@ -1,8 +1,6 @@
 # ============================================================
-# Growth Stock Analyzer - 設定ファイル (テンプレート)
+# Growth Stock Analyzer - 設定ファイル
 # ============================================================
-# このファイルを config.yaml にコピーして使用してください:
-#   cp config.yaml.example config.yaml
 
 # --- API Keys ---
 # 各APIの無料プランでの制限:
@@ -81,6 +79,32 @@ watchlist:
     - { ticker: "ORCL",  name: "Oracle",               sector: "クラウド/DB" }
     - { ticker: "IBM",   name: "IBM",                  sector: "AI/コンサルティング" }
     - { ticker: "ADBE",  name: "Adobe",                sector: "クリエイティブ/SaaS" }
+    # --- ロボティクス/量子コンピュータ (追加) ---
+    - { ticker: "IONQ",  name: "IonQ",                  sector: "量子コンピュータ" }
+    - { ticker: "RGTI",  name: "Rigetti Computing",      sector: "量子コンピュータ" }
+    - { ticker: "RKLB",  name: "Rocket Lab",             sector: "宇宙/ロケット" }
+    # --- AI/データインフラ (追加) ---
+    - { ticker: "AI",    name: "C3.ai",                  sector: "AI/エンタープライズ" }
+    - { ticker: "PATH",  name: "UiPath",                 sector: "RPA/自動化" }
+    - { ticker: "MDB",   name: "MongoDB",                sector: "クラウド/DB" }
+    - { ticker: "ESTC",  name: "Elastic",                sector: "検索/データ分析" }
+    # --- フィンテック/決済 (追加) ---
+    - { ticker: "PYPL",  name: "PayPal",                 sector: "フィンテック/決済" }
+    - { ticker: "SQ",    name: "Block Inc (old)",        sector: "フィンテック" }
+    - { ticker: "SOFI",  name: "SoFi Technologies",      sector: "フィンテック/ネオバンク" }
+    - { ticker: "AFRM",  name: "Affirm Holdings",        sector: "フィンテック/BNPL" }
+    # --- EV/クリーンエネルギー (追加) ---
+    - { ticker: "RIVN",  name: "Rivian Automotive",      sector: "EV" }
+    - { ticker: "LCID",  name: "Lucid Group",            sector: "EV" }
+    - { ticker: "ENPH",  name: "Enphase Energy",         sector: "太陽光/クリーンエネルギー" }
+    # --- エンタメ/ゲーム (追加) ---
+    - { ticker: "RBLX",  name: "Roblox",                 sector: "ゲーム/メタバース" }
+    - { ticker: "TTWO",  name: "Take-Two Interactive",   sector: "ゲーム" }
+    - { ticker: "EA",    name: "Electronic Arts",        sector: "ゲーム" }
+    # --- ヘルスケア (追加) ---
+    - { ticker: "MRNA",  name: "Moderna",                sector: "バイオテック/mRNA" }
+    - { ticker: "ABBV",  name: "AbbVie",                 sector: "製薬/バイオ" }
+    - { ticker: "TMO",   name: "Thermo Fisher Scientific", sector: "ライフサイエンス" }
 
   us_etfs:
     - { ticker: "VOO",  name: "Vanguard S&P 500",       sector: "指数ETF" }
@@ -129,6 +153,27 @@ watchlist:
     - { ticker: "6594.T",  name: "日本電産",         sector: "モーター/EV部品" }
     - { ticker: "9432.T",  name: "NTT",             sector: "通信" }
     - { ticker: "9433.T",  name: "KDDI",            sector: "通信" }
+    # --- AI/DX関連 (追加) ---
+    - { ticker: "3993.T",  name: "PKSHA Technology",  sector: "AI/自然言語処理" }
+    - { ticker: "4443.T",  name: "Sansan",            sector: "SaaS/DX" }
+    - { ticker: "4478.T",  name: "フリー",            sector: "SaaS/会計" }
+    - { ticker: "4816.T",  name: "東映アニメーション",  sector: "エンタメ/アニメ" }
+    # --- 防衛/重工 (追加) ---
+    - { ticker: "7012.T",  name: "川崎重工業",       sector: "防衛/航空" }
+    - { ticker: "7013.T",  name: "IHI",             sector: "防衛/エンジン" }
+    # --- 不動産/インフラ (追加) ---
+    - { ticker: "8830.T",  name: "住友不動産",       sector: "不動産" }
+    - { ticker: "9005.T",  name: "東急",             sector: "鉄道/不動産" }
+    # --- 自動車 (追加) ---
+    - { ticker: "7203.T",  name: "トヨタ自動車",     sector: "自動車" }
+    - { ticker: "7267.T",  name: "ホンダ",           sector: "自動車" }
+    - { ticker: "7269.T",  name: "スズキ",           sector: "自動車" }
+    # --- 食品/消費 (追加) ---
+    - { ticker: "2914.T",  name: "JT（日本たばこ）",  sector: "食品/たばこ" }
+    - { ticker: "2801.T",  name: "キッコーマン",     sector: "食品/調味料" }
+    # --- 保険/金融 (追加) ---
+    - { ticker: "8766.T",  name: "東京海上HD",       sector: "損保" }
+    - { ticker: "8411.T",  name: "みずほFG",         sector: "メガバンク" }
 
 # --- テクニカル分析パラメータ ---
 technical:

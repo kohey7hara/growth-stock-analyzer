@@ -177,8 +177,13 @@ def page_dashboard():
         st.warning("分析データが見つかりません。先に `python run.py` を実行してください。")
         return
 
-    # --- 全銘柄ランキング ---
+    # --- 市場フィルター ---
     st.subheader("全銘柄ランキング")
+    market_filter = st.radio(
+        "市場",
+        ["すべて", "🇺🇸 米国株", "🇯🇵 日本株", "📈 ETF"],
+        horizontal=True,
+    )
     st.caption("📊 予測精度の目安: 1日後は高精度 → 6ヶ月後は参考程度（期間が長いほどブレが大きくなります）")
     st.caption("前日比: 前営業日の終値からの変動率 | 予測: 本日の終値を起点にした予測変動率")
     pred_headers = {
@@ -190,8 +195,23 @@ def page_dashboard():
     }
 
     pred_df = load_predictions()
+
+    # 市場フィルター適用
+    filtered_df = analysis_df.copy()
+    if market_filter == "🇺🇸 米国株":
+        filtered_df = filtered_df[
+            (~filtered_df["ticker"].str.endswith(".T")) &
+            (~filtered_df["ticker"].isin(["VOO","QQQ","SOXX","ARKK","XLF","XLE","XLV"]))
+        ]
+    elif market_filter == "🇯🇵 日本株":
+        filtered_df = filtered_df[filtered_df["ticker"].str.endswith(".T")]
+    elif market_filter == "📈 ETF":
+        filtered_df = filtered_df[filtered_df["ticker"].isin(["VOO","QQQ","SOXX","ARKK","XLF","XLE","XLV"])]
+
+    st.caption(f"表示: {len(filtered_df)}銘柄 / 全{len(analysis_df)}銘柄")
+
     rows = []
-    for _, r in analysis_df.sort_values("total_score", ascending=False).iterrows():
+    for _, r in filtered_df.sort_values("total_score", ascending=False).iterrows():
         tk = r["ticker"]
         name = r.get("name", "")
         market = r.get("market", "US")
