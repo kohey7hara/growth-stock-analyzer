@@ -197,16 +197,17 @@ def page_dashboard():
     pred_df = load_predictions()
 
     # 市場フィルター適用
+    ETF_TICKERS = ["VOO","QQQ","SOXX","ARKK","XLF","XLE","XLV"]
     filtered_df = analysis_df.copy()
     if market_filter == "🇺🇸 米国株":
         filtered_df = filtered_df[
-            (~filtered_df["ticker"].str.endswith(".T")) &
-            (~filtered_df["ticker"].isin(["VOO","QQQ","SOXX","ARKK","XLF","XLE","XLV"]))
+            (filtered_df["market"] == "US") &
+            (~filtered_df["ticker"].isin(ETF_TICKERS))
         ]
     elif market_filter == "🇯🇵 日本株":
-        filtered_df = filtered_df[filtered_df["ticker"].str.endswith(".T")]
+        filtered_df = filtered_df[filtered_df["market"] == "JP"]
     elif market_filter == "📈 ETF":
-        filtered_df = filtered_df[filtered_df["ticker"].isin(["VOO","QQQ","SOXX","ARKK","XLF","XLE","XLV"])]
+        filtered_df = filtered_df[filtered_df["ticker"].isin(ETF_TICKERS)]
 
     st.caption(f"表示: {len(filtered_df)}銘柄 / 全{len(analysis_df)}銘柄")
 
