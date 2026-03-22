@@ -86,7 +86,7 @@ st.set_page_config(page_title="Growth Stock Analyzer", layout="wide")
 st.sidebar.title("Growth Stock Analyzer")
 page = st.sidebar.radio(
     "ページ選択",
-    ["ダッシュボード", "銘柄詳細", "ポートフォリオ", "スクリーニング", "予測シミュレーション"],
+    ["ダッシュボード", "銘柄詳細", "ポートフォリオ", "スクリーニング", "予測シミュレーション", "予測精度検証"],
 )
 
 
@@ -565,6 +565,147 @@ def page_prediction():
 
 
 # ──────────────────────────────────────────────
+# ページ6: 予測精度検証
+# ──────────────────────────────────────────────
+
+def page_accuracy():
+    st.header("予測精度検証")
+    st.caption("過去の予測が実際にどれだけ当たったかを検証します。データは毎日蓄積されます。")
+
+    # 精度データ読み込み
+    acc_path = DATA_DIR / "prediction_accuracy.csv"
+    if not acc_path.exists():
+        st.info("まだ予測精度データがありません。毎日データが更新されると、翌日以降に予測の的中率が表示されます。")
+        st.markdown("---")
+        st.markdown("**仕組み:**")
+        st.markdown("1. 毎朝、その日の予測をスナップショットとして保存")
+        st.markdown("2. 翌日以降、実際の株価と比較して精度を算出")
+        st.markdown("3. 方向（上昇/下落）の的中率と誤差幅を表示")
+        return
+
+    acc_df = pd.read_csv(acc_path)
+    if acc_df.empty:
+        st.info("評価可能な予測データがまだありません。明日以降に結果が表示されます。")
+        return
+
+    # === サマリー ===
+    st.subheader("全体サマリー")
+
+    total = len(acc_df)
+    direction_acc = acc_df["direction_correct"].mean() * 100
+    avg_error = acc_df["error_pct"].abs().mean()
+    evaluated = acc_df[acc_df["status"] == "評価可能"]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("総予測件数", f"{total}件")
+    c2.metric("方向的中率", f"{direction_acc:.1f}%",
+              delta="良好" if direction_acc >= 55 else "改善余地あり",
+              delta_color="normal" if direction_acc >= 55 else "inverse")
+    c3.metric("平均誤差", f"{avg_error:.2f}%")
+    c4.metric("評価済み予測", f"{len(evaluated)}件")
+
+    st.markdown("---")
+
+    # === ホライズン別精度 ===
+    st.subheader("予測期間別の精度")
+    horizon_order = ["1日後", "1週後", "1ヶ月後", "3ヶ月後", "6ヶ月後"]
+    horizon_data = []
+    for h in horizon_order:
+        h_df = acc_df[acc_df["horizon"] == h]
+        if len(h_df) > 0:
+            horizon_data.append({
+                "予測期間": h,
+                "件数": len(h_df),
+                "方向的中率": f"{h_df['direction_correct'].mean()*100:.1f}%",
+                "平均予測": f"{h_df['predicted_change_pct'].mean():+.2f}%",
+                "平均実際": f"{h_df['actual_change_pct'].mean():+.2f}%",
+                "平均誤差": f"{h_df['error_pct'].abs().mean():.2f}%",
+            })
+    if horizon_data:
+        st.dataframe(pd.DataFrame(horizon_data), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # === 銘柄別フィルター ===
+    st.subheader("銘柄別の予測 vs 実績")
+
+    # フィルター
+    fc1, fc2, fc3 = st.columns(3)
+    with fc1:
+        tickers = sorted(acc_df["ticker"].unique())
+        ticker_labels = []
+        for t in tickers:
+            name = acc_df[acc_df["ticker"]==t]["name"].iloc[0] if "name" in acc_df.columns else t
+            ticker_labels.append(f"{t} ({name})")
+        selected_idx = fc1.selectbox("銘柄", range(len(tickers)), format_func=lambda i: ticker_labels[i])
+        selected_ticker = tickers[selected_idx] if tickers else None
+    with fc2:
+        selected_horizon = fc2.selectbox("予測期間", ["すべて"] + horizon_order)
+    with fc3:
+        selected_result = fc3.selectbox("結果", ["すべて", "的中のみ", "外れのみ"])
+
+    # フィルター適用
+    filtered = acc_df.copy()
+    if selected_ticker:
+        filtered = filtered[filtered["ticker"] == selected_ticker]
+    if selected_horizon != "すべて":
+        filtered = filtered[filtered["horizon"] == selected_horizon]
+    if selected_result == "的中のみ":
+        filtered = filtered[filtered["direction_correct"] == True]
+    elif selected_result == "外れのみ":
+        filtered = filtered[filtered["direction_correct"] == False]
+
+    if filtered.empty:
+        st.info("条件に合う予測がありません")
+    else:
+        # 結果テーブル
+        display_cols = {
+            "prediction_date": "予測日",
+            "ticker": "銘柄",
+            "name": "名前",
+            "horizon": "期間",
+            "base_price": "基準価格",
+            "actual_price": "現在価格",
+            "predicted_change_pct": "予測(%)",
+            "actual_change_pct": "実際(%)",
+            "error_pct": "誤差(%)",
+            "direction_correct": "方向",
+            "analysis_comment": "分析コメント",
+        }
+        disp = filtered[list(display_cols.keys())].rename(columns=display_cols)
+        disp["方向"] = disp["方向"].map({True: "◎的中", False: "✕外れ"})
+
+        # 色付き表示
+        def color_direction(val):
+            if val == "◎的中":
+                return "background-color: rgba(0,200,0,0.2)"
+            return "background-color: rgba(255,0,0,0.2)"
+
+        styled = disp.style.applymap(color_direction, subset=["方向"])
+        st.dataframe(styled, use_container_width=True, hide_index=True, height=500)
+
+    st.markdown("---")
+
+    # === 的中率チャート（日別推移） ===
+    if len(acc_df["prediction_date"].unique()) > 1:
+        st.subheader("方向的中率の推移")
+        daily = acc_df.groupby("prediction_date").agg(
+            accuracy=("direction_correct", "mean"),
+            count=("direction_correct", "count")
+        ).reset_index()
+        daily["accuracy"] = daily["accuracy"] * 100
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=daily["prediction_date"], y=daily["accuracy"],
+                             name="的中率", marker_color=[
+                                 "green" if a >= 55 else "red" for a in daily["accuracy"]
+                             ]))
+        fig.add_hline(y=50, line_dash="dash", line_color="gray", annotation_text="50%ライン（ランダム）")
+        fig.update_layout(yaxis_title="方向的中率(%)", yaxis_range=[0, 100], height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+
+# ──────────────────────────────────────────────
 # ルーティング
 # ──────────────────────────────────────────────
 
@@ -573,3 +714,4 @@ elif page == "銘柄詳細": page_detail()
 elif page == "ポートフォリオ": page_portfolio()
 elif page == "スクリーニング": page_screening()
 elif page == "予測シミュレーション": page_prediction()
+elif page == "予測精度検証": page_accuracy()

@@ -53,6 +53,8 @@ jobs:
           git add data/sentiment_data_*.csv
           git add data/macro_data_*.csv
           git add data/latest_predictions.csv
+          git add data/prediction_accuracy.csv || true
+          git add data/prediction_history/ || true
           git add output/ || true
 
           # Check if there are changes

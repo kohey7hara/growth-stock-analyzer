@@ -208,6 +208,23 @@ def main():
             import traceback
             traceback.print_exc()
 
+    # Step 7: 予測スナップショット保存 & 精度評価
+    if run_analyze:
+        logger.info("\n[Step 7/7] 予測精度トラッキング...")
+        try:
+            from prediction_tracker import save_daily_snapshot, evaluate_predictions
+            # 今日の予測をスナップショットとして保存
+            save_daily_snapshot()
+            # 過去の予測と現在の価格を比較して精度を評価
+            accuracy_df = evaluate_predictions()
+            if accuracy_df is not None and not accuracy_df.empty:
+                correct = accuracy_df["direction_correct"].mean() * 100
+                logger.info(f"  予測方向的中率: {correct:.1f}% ({len(accuracy_df)}件)")
+            else:
+                logger.info("  過去の予測データがまだありません（明日以降に精度レポートが生成されます）")
+        except Exception as e:
+            logger.warning(f"  予測トラッキングスキップ: {e}")
+
     elapsed = (datetime.now() - start).total_seconds()
     logger.info(f"\n全処理完了: {elapsed:.1f}秒")
     logger.info("=" * 60)
