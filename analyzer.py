@@ -20,13 +20,20 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
 
+_log_handlers = [logging.StreamHandler()]
+_log_dir = BASE_DIR / "logs"
+try:
+    _log_dir.mkdir(exist_ok=True)
+    _log_handlers.append(
+        logging.FileHandler(_log_dir / "analyzer.log", encoding="utf-8")
+    )
+except OSError:
+    pass  # Streamlit Cloud等でlogsディレクトリを作れない場合はコンソールのみ
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(BASE_DIR / "logs" / "analyzer.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
+    handlers=_log_handlers,
 )
 logger = logging.getLogger(__name__)
 
