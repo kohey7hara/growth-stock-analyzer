@@ -131,6 +131,16 @@ def page_dashboard():
     macro_df = load_macro()
     analysis_df = load_analysis()
 
+    # データ最終更新日時を表示
+    import os
+    _analysis_path = DATA_DIR / "latest_analysis.csv"
+    if _analysis_path.exists():
+        _mtime = os.path.getmtime(_analysis_path)
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        _jst = _tz(_td(hours=9))
+        _updated = _dt.fromtimestamp(_mtime, tz=_jst).strftime("%Y/%m/%d %H:%M:%S")
+        st.caption(f"🕐 最終更新: {_updated} (JST)")
+
     # --- 市況判定 + リスクサマリー ---
     hcols = st.columns([3, 1])
     with hcols[0]:
