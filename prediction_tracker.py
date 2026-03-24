@@ -68,11 +68,13 @@ def evaluate_predictions():
         return pd.DataFrame()
 
     current_df = pd.read_csv(current_prices_path)
-    if "ticker" not in current_df.columns or "close" not in current_df.columns:
-        logger.warning("株価データにticker/closeカラムがありません")
+    # price カラムを使用（close がない場合のフォールバック）
+    price_col = "close" if "close" in current_df.columns else "price"
+    if "ticker" not in current_df.columns or price_col not in current_df.columns:
+        logger.warning(f"株価データにticker/{price_col}カラムがありません")
         return pd.DataFrame()
 
-    current_prices = dict(zip(current_df["ticker"], current_df["close"]))
+    current_prices = dict(zip(current_df["ticker"], current_df[price_col]))
 
     # 銘柄名マッピング
     name_map = {}
@@ -102,7 +104,8 @@ def evaluate_predictions():
             price_file = TRACKER_DIR / f"prices_{snapshot_date_str}.csv"
             if price_file.exists():
                 base_prices_df = pd.read_csv(price_file)
-                base_prices = dict(zip(base_prices_df["ticker"], base_prices_df["close"]))
+                bp_col = "close" if "close" in base_prices_df.columns else "price"
+                base_prices = dict(zip(base_prices_df["ticker"], base_prices_df[bp_col]))
             else:
                 base_prices = {}
 
@@ -112,7 +115,7 @@ def evaluate_predictions():
                 if not ticker or ticker not in current_prices:
                     continue
 
-                base_price = base_prices.get(ticker, row.get("base_price", None))
+                base_price = base_prices.get(ticker, row.get("pred_current_price", row.get("base_price", None)))
                 if base_price is None or pd.isna(base_price) or base_price == 0:
                     continue
 
