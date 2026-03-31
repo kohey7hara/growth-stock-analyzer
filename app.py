@@ -54,13 +54,19 @@ def get_prediction_for_ticker(ticker, pred_df):
     if row.empty:
         return {}
     r = row.iloc[0]
+    base_price = r.get("pred_current_price", None)
     out = {}
+    if base_price is not None and pd.notna(base_price):
+        out["base_price"] = float(base_price)
     for d in [1, 7, 30]:
         pct = r.get(f"pred_{d}d_pct")
         if pd.notna(pct):
             out[f"p{d}"] = float(pct)
             out[f"p{d}_l80"] = float(r.get(f"pred_{d}d_l80", 0))
             out[f"p{d}_u80"] = float(r.get(f"pred_{d}d_u80", 0))
+            # 予測株価を算出
+            if "base_price" in out:
+                out[f"p{d}_price"] = round(out["base_price"] * (1 + float(pct) / 100), 2)
     return out
 
 def compute_rsi(series, period=14):
@@ -195,12 +201,12 @@ def page_dashboard():
         ["すべて", "🇺🇸 米国株", "🇯🇵 日本株", "📈 ETF"],
         horizontal=True,
     )
-    st.caption("📊 予測精度の目安: 1日後は高精度 → 1ヶ月後は参考程度（期間が長いほどブレが大きくなります）")
+    st.caption("📊 5つのAIエージェント（テクニカル・モメンタム・リバーサル・ボラティリティ・トレンド）のアンサンブル予測")
     st.caption("前日比: 前営業日の終値からの変動率 | 予測: 本日の終値を起点にした予測変動率")
     pred_headers = {
-        1: ("1日後(80%)", "予測した騰落の方向(上がるor下がる)が当たる確率が約80%"),
-        7: ("1週後(75%)", "1週間後の方向予測。当たる確率は約75%"),
-        30: ("1月後(65%)", "1ヶ月後の方向予測。決算や材料で変動の可能性あり。約65%"),
+        1: ("1日後予測", "5エージェントの総合予測。短期の方向性は比較的信頼できる"),
+        7: ("1週後予測", "1週間後の総合予測。イベントリスクで変動の可能性あり"),
+        30: ("1月後予測", "1ヶ月後の総合予測。決算や材料で大きく変動する可能性あり"),
     }
 
     pred_df = load_predictions()
@@ -245,8 +251,9 @@ def page_dashboard():
             pct = preds.get(f"p{days}")
             l80 = preds.get(f"p{days}_l80")
             u80 = preds.get(f"p{days}_u80")
+            pred_price = preds.get(f"p{days}_price")
             if pct is not None:
-                rd[hdr] = {"pct": pct, "l80": l80, "u80": u80}
+                rd[hdr] = {"pct": pct, "l80": l80, "u80": u80, "price": pred_price}
             else:
                 rd[hdr] = None
         rd["出来高比率"] = fmt_vol(r.get("vol_ratio"), r.get("volume"))
@@ -289,14 +296,23 @@ def page_dashboard():
                     pct = val["pct"]
                     l80 = val.get("l80")
                     u80 = val.get("u80")
+                    pred_price = val.get("price")
                     if l80 is not None and l80 > 0:
                         color, fw = "#006400", "bold"
                     elif pct >= 0:
                         color, fw = "#228B22", "normal"
                     else:
                         color, fw = "red", "normal"
-                    cell = f'<span style="color:{color};font-weight:{fw}">{pct:+.1f}%</span>'
-                    tip = f"予測: {pct:+.1f}% | この予測が当たる範囲: 80%の確率で{l80:+.1f}%~{u80:+.1f}%" if l80 is not None else ""
+                    # 予測株価 + 変動率
+                    if pred_price is not None:
+                        if pred_price > 1000:
+                            price_str = f"{pred_price:,.0f}"
+                        else:
+                            price_str = f"{pred_price:,.2f}"
+                        cell = f'<span style="color:{color};font-weight:{fw}">{price_str}<br><small>({pct:+.1f}%)</small></span>'
+                    else:
+                        cell = f'<span style="color:{color};font-weight:{fw}">{pct:+.1f}%</span>'
+                    tip = f"予測: {pct:+.1f}% | 80%信頼区間: {l80:+.1f}%~{u80:+.1f}%" if l80 is not None else ""
                     html += f'<td style="{style}" title="{tip}">{cell}</td>'
             elif c == "前日比(%)":
                 try:
@@ -620,6 +636,8 @@ def page_accuracy():
     total = len(acc_df)
     direction_acc = acc_df["direction_correct"].mean() * 100
     avg_error = acc_df["error_pct"].abs().mean()
+    avg_pred = acc_df["predicted_change_pct"].mean()
+    avg_actual = acc_df["actual_change_pct"].mean()
 
     c1, c2, c3 = st.columns(3)
     c1.metric("総予測件数", f"{total:,}件")
@@ -627,6 +645,16 @@ def page_accuracy():
               delta="良好" if direction_acc >= 55 else "改善余地あり",
               delta_color="normal" if direction_acc >= 55 else "inverse")
     c3.metric("平均誤差", f"{avg_error:.2f}%")
+
+    # わかりやすい解説
+    st.markdown(f"""
+<div style="background:rgba(255,255,255,0.05);border-radius:8px;padding:12px 16px;font-size:13px;line-height:1.8;margin:8px 0">
+<b>📖 この数字の見方:</b><br>
+• <b>方向的中率 {direction_acc:.0f}%</b> →「上がる/下がる」の方向を当てた割合。50%がランダム、<b>55%以上で良好</b>、60%超で優秀<br>
+• <b>平均誤差 {avg_error:.2f}%</b> → 予測と実際の株価変動のズレ幅。<b>2%以下なら良好</b>、5%超なら改善が必要<br>
+• <b>AIの予測傾向</b> → 平均で「{avg_pred:+.2f}%動く」と予測したが、実際は「{avg_actual:+.2f}%」だった
+</div>
+""", unsafe_allow_html=True)
 
     st.markdown("---")
 
@@ -637,13 +665,18 @@ def page_accuracy():
     for h in horizon_order:
         h_df = acc_df[acc_df["horizon"] == h]
         if len(h_df) > 0:
+            h_acc = h_df['direction_correct'].mean()*100
+            h_pred = h_df['predicted_change_pct'].mean()
+            h_actual = h_df['actual_change_pct'].mean()
+            h_err = h_df['error_pct'].abs().mean()
             horizon_data.append({
                 "予測期間": h,
                 "件数": len(h_df),
-                "方向的中率": f"{h_df['direction_correct'].mean()*100:.1f}%",
-                "平均予測": f"{h_df['predicted_change_pct'].mean():+.2f}%",
-                "平均実際": f"{h_df['actual_change_pct'].mean():+.2f}%",
-                "平均誤差": f"{h_df['error_pct'].abs().mean():.2f}%",
+                "方向的中率": f"{h_acc:.1f}%",
+                "AI予測(平均)": f"{h_pred:+.2f}%",
+                "実際の結果(平均)": f"{h_actual:+.2f}%",
+                "平均誤差": f"{h_err:.2f}%",
+                "評価": "🎯" if h_acc >= 55 else "⚠️" if h_acc >= 45 else "❌",
             })
     if horizon_data:
         st.dataframe(pd.DataFrame(horizon_data), use_container_width=True, hide_index=True)
