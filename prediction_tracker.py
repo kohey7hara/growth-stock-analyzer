@@ -125,10 +125,8 @@ def evaluate_predictions():
                 # 各予測ホライズンを評価
                 horizons = [
                     ("1日後", 1, "pred_1d_pct"),
-                    ("1週後", 7, "pred_1w_pct"),
-                    ("1ヶ月後", 30, "pred_1m_pct"),
-                    ("3ヶ月後", 90, "pred_3m_pct"),
-                    ("6ヶ月後", 180, "pred_6m_pct"),
+                    ("1週後", 7, "pred_7d_pct"),
+                    ("1ヶ月後", 30, "pred_30d_pct"),
                 ]
 
                 for horizon_name, horizon_days, col_name in horizons:

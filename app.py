@@ -55,7 +55,7 @@ def get_prediction_for_ticker(ticker, pred_df):
         return {}
     r = row.iloc[0]
     out = {}
-    for d in [1, 7, 30, 90, 180]:
+    for d in [1, 7, 30]:
         pct = r.get(f"pred_{d}d_pct")
         if pd.notna(pct):
             out[f"p{d}"] = float(pct)
@@ -607,10 +607,7 @@ def page_accuracy():
     if not acc_path.exists():
         st.info("まだ予測精度データがありません。毎日データが更新されると、翌日以降に予測の的中率が表示されます。")
         st.markdown("---")
-        st.markdown("**仕組み:**")
-        st.markdown("1. 毎朝、その日の予測をスナップショットとして保存")
-        st.markdown("2. 翌日以降、実際の株価と比較して精度を算出")
-        st.markdown("3. 方向（上昇/下落）の的中率と誤差幅を表示")
+        st.markdown("**仕組み:** 毎朝の予測をスナップショットとして保存 → 翌日以降、実際の株価と比較して精度を算出")
         return
 
     acc_df = pd.read_csv(acc_path)
@@ -620,25 +617,22 @@ def page_accuracy():
 
     # === サマリー ===
     st.subheader("全体サマリー")
-
     total = len(acc_df)
     direction_acc = acc_df["direction_correct"].mean() * 100
     avg_error = acc_df["error_pct"].abs().mean()
-    evaluated = acc_df[acc_df["status"] == "評価可能"]
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("総予測件数", f"{total}件")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("総予測件数", f"{total:,}件")
     c2.metric("方向的中率", f"{direction_acc:.1f}%",
               delta="良好" if direction_acc >= 55 else "改善余地あり",
               delta_color="normal" if direction_acc >= 55 else "inverse")
     c3.metric("平均誤差", f"{avg_error:.2f}%")
-    c4.metric("評価済み予測", f"{len(evaluated)}件")
 
     st.markdown("---")
 
     # === ホライズン別精度 ===
     st.subheader("予測期間別の精度")
-    horizon_order = ["1日後", "1週後", "1ヶ月後", "3ヶ月後", "6ヶ月後"]
+    horizon_order = ["1日後", "1週後", "1ヶ月後"]
     horizon_data = []
     for h in horizon_order:
         h_df = acc_df[acc_df["horizon"] == h]
@@ -656,82 +650,161 @@ def page_accuracy():
 
     st.markdown("---")
 
-    # === 銘柄別フィルター ===
-    st.subheader("銘柄別の予測 vs 実績")
+    # === フィルター ===
+    st.subheader("全銘柄 予測 vs 実績")
 
-    # フィルター
     fc1, fc2, fc3 = st.columns(3)
     with fc1:
-        tickers = sorted(acc_df["ticker"].unique())
-        ticker_labels = []
-        for t in tickers:
-            name = acc_df[acc_df["ticker"]==t]["name"].iloc[0] if "name" in acc_df.columns else t
-            ticker_labels.append(f"{t} ({name})")
-        selected_idx = fc1.selectbox("銘柄", range(len(tickers)), format_func=lambda i: ticker_labels[i])
-        selected_ticker = tickers[selected_idx] if tickers else None
+        horizon_filter = fc1.selectbox("予測期間", ["1日後"] + [h for h in horizon_order if h != "1日後"])
     with fc2:
-        selected_horizon = fc2.selectbox("予測期間", ["すべて"] + horizon_order)
+        result_filter = fc2.selectbox("結果", ["すべて", "◎的中のみ", "✕外れのみ"])
     with fc3:
-        selected_result = fc3.selectbox("結果", ["すべて", "的中のみ", "外れのみ"])
+        date_options = sorted(acc_df["prediction_date"].unique(), reverse=True)
+        date_filter = fc3.selectbox("予測日", ["すべて（最新）"] + list(date_options))
 
     # フィルター適用
-    filtered = acc_df.copy()
-    if selected_ticker:
-        filtered = filtered[filtered["ticker"] == selected_ticker]
-    if selected_horizon != "すべて":
-        filtered = filtered[filtered["horizon"] == selected_horizon]
-    if selected_result == "的中のみ":
+    filtered = acc_df[acc_df["horizon"] == horizon_filter].copy()
+    if result_filter == "◎的中のみ":
         filtered = filtered[filtered["direction_correct"] == True]
-    elif selected_result == "外れのみ":
+    elif result_filter == "✕外れのみ":
         filtered = filtered[filtered["direction_correct"] == False]
+
+    if date_filter != "すべて（最新）":
+        filtered = filtered[filtered["prediction_date"] == date_filter]
+    else:
+        # 各銘柄の最新予測日のみ表示
+        if not filtered.empty:
+            filtered = filtered.sort_values("prediction_date", ascending=False)
+            filtered = filtered.drop_duplicates(subset=["ticker"], keep="first")
 
     if filtered.empty:
         st.info("条件に合う予測がありません")
     else:
-        # 結果テーブル
-        display_cols = {
-            "prediction_date": "予測日",
-            "ticker": "銘柄",
-            "name": "名前",
-            "horizon": "期間",
-            "base_price": "基準価格",
-            "actual_price": "現在価格",
-            "predicted_change_pct": "予測(%)",
-            "actual_change_pct": "実際(%)",
-            "error_pct": "誤差(%)",
-            "direction_correct": "方向",
-            "analysis_comment": "分析コメント",
-        }
-        disp = filtered[list(display_cols.keys())].rename(columns=display_cols)
-        disp["方向"] = disp["方向"].map({True: "◎的中", False: "✕外れ"})
+        # --- 全銘柄一覧テーブル (HTML) ---
+        filtered = filtered.sort_values("error_pct", key=abs)
 
-        # 色付き表示
-        def color_direction(val):
-            if val == "◎的中":
-                return "background-color: rgba(0,200,0,0.2)"
-            return "background-color: rgba(255,0,0,0.2)"
+        html = '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">'
+        html += '<thead><tr style="background:#1a1a2e;color:white">'
+        headers = ["銘柄", "名前", "予測日", "基準価格", "現在価格", "予測(%)", "実際(%)", "誤差(%)", "方向", "判定"]
+        for h in headers:
+            html += f'<th style="padding:6px 8px;white-space:nowrap;text-align:left">{h}</th>'
+        html += '</tr></thead><tbody>'
 
-        styled = disp.style.applymap(color_direction, subset=["方向"])
-        st.dataframe(styled, use_container_width=True, hide_index=True, height=500)
+        for _, r in filtered.iterrows():
+            dc = r.get("direction_correct", False)
+            bg = "background:rgba(0,200,0,0.08);" if dc else "background:rgba(255,0,0,0.08);"
+            html += f'<tr style="{bg}border-bottom:1px solid rgba(255,255,255,0.1)">'
+
+            pred_pct = r.get("predicted_change_pct", 0)
+            actual_pct = r.get("actual_change_pct", 0)
+            error_pct = r.get("error_pct", 0)
+
+            pred_color = "color:#4CAF50" if pred_pct > 0 else "color:#f44336" if pred_pct < 0 else ""
+            actual_color = "color:#4CAF50" if actual_pct > 0 else "color:#f44336" if actual_pct < 0 else ""
+
+            direction_icon = "◎" if dc else "✕"
+            direction_style = "color:#4CAF50;font-weight:bold" if dc else "color:#f44336;font-weight:bold"
+
+            # 精度判定ラベル
+            abs_err = abs(error_pct)
+            if dc and abs_err < 2:
+                judge = "🎯 精度良好"
+            elif dc and abs_err < 5:
+                judge = "○ 方向的中"
+            elif dc:
+                judge = "△ 方向的中(大誤差)"
+            else:
+                judge = "✕ 外れ"
+
+            base_p = r.get("base_price", 0)
+            actual_p = r.get("actual_price", 0)
+            # 価格フォーマット（日本株は整数、米国株は小数2桁）
+            def fmt_price(p):
+                if p > 1000:
+                    return f"{p:,.0f}"
+                return f"{p:,.2f}"
+
+            cells = [
+                (str(r.get("ticker", "")), ""),
+                (str(r.get("name", ""))[:10], ""),
+                (str(r.get("prediction_date", "")), ""),
+                (fmt_price(base_p), "text-align:right"),
+                (fmt_price(actual_p), "text-align:right"),
+                (f"{pred_pct:+.2f}%", f"text-align:right;{pred_color}"),
+                (f"{actual_pct:+.2f}%", f"text-align:right;{actual_color}"),
+                (f"{error_pct:+.2f}%", "text-align:right"),
+                (direction_icon, f"text-align:center;{direction_style}"),
+                (judge, "white-space:nowrap"),
+            ]
+            for val, style in cells:
+                html += f'<td style="padding:4px 8px;{style}">{val}</td>'
+            html += '</tr>'
+
+        html += '</tbody></table></div>'
+        st.markdown(html, unsafe_allow_html=True)
+        st.caption(f"表示: {len(filtered)}件")
+
+    st.markdown("---")
+
+    # === 銘柄別的中率ランキング ===
+    st.subheader("銘柄別 的中率ランキング")
+    oneday = acc_df[acc_df["horizon"] == "1日後"]
+    if not oneday.empty:
+        ticker_stats = oneday.groupby("ticker").agg(
+            name=("name", "first"),
+            count=("direction_correct", "count"),
+            accuracy=("direction_correct", "mean"),
+            avg_error=("error_pct", lambda x: x.abs().mean()),
+            avg_predicted=("predicted_change_pct", "mean"),
+            avg_actual=("actual_change_pct", "mean"),
+        ).reset_index()
+        ticker_stats["accuracy"] = (ticker_stats["accuracy"] * 100).round(1)
+        ticker_stats["avg_error"] = ticker_stats["avg_error"].round(2)
+        ticker_stats = ticker_stats.sort_values("accuracy", ascending=False)
+
+        rank_html = '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">'
+        rank_html += '<thead><tr style="background:#1a1a2e;color:white">'
+        for h in ["#", "銘柄", "名前", "予測回数", "的中率", "平均予測", "平均実際", "平均誤差"]:
+            rank_html += f'<th style="padding:6px 8px;text-align:left">{h}</th>'
+        rank_html += '</tr></thead><tbody>'
+
+        for i, (_, r) in enumerate(ticker_stats.iterrows()):
+            acc_val = r["accuracy"]
+            bg = "background:rgba(0,200,0,0.08);" if acc_val >= 55 else "background:rgba(255,0,0,0.08);" if acc_val < 45 else ""
+            acc_color = "color:#4CAF50" if acc_val >= 55 else "color:#f44336" if acc_val < 45 else ""
+            rank_html += f'<tr style="{bg}border-bottom:1px solid rgba(255,255,255,0.1)">'
+            rank_html += f'<td style="padding:4px 8px">{i+1}</td>'
+            rank_html += f'<td style="padding:4px 8px">{r["ticker"]}</td>'
+            rank_html += f'<td style="padding:4px 8px">{str(r["name"])[:10]}</td>'
+            rank_html += f'<td style="padding:4px 8px;text-align:right">{r["count"]}回</td>'
+            rank_html += f'<td style="padding:4px 8px;text-align:right;font-weight:bold;{acc_color}">{acc_val:.1f}%</td>'
+            rank_html += f'<td style="padding:4px 8px;text-align:right">{r["avg_predicted"]:+.2f}%</td>'
+            rank_html += f'<td style="padding:4px 8px;text-align:right">{r["avg_actual"]:+.2f}%</td>'
+            rank_html += f'<td style="padding:4px 8px;text-align:right">{r["avg_error"]:.2f}%</td>'
+            rank_html += '</tr>'
+
+        rank_html += '</tbody></table></div>'
+        st.markdown(rank_html, unsafe_allow_html=True)
 
     st.markdown("---")
 
     # === 的中率チャート（日別推移） ===
     if len(acc_df["prediction_date"].unique()) > 1:
-        st.subheader("方向的中率の推移")
-        daily = acc_df.groupby("prediction_date").agg(
+        st.subheader("方向的中率の推移（1日後予測）")
+        oneday_daily = oneday.groupby("prediction_date").agg(
             accuracy=("direction_correct", "mean"),
             count=("direction_correct", "count")
         ).reset_index()
-        daily["accuracy"] = daily["accuracy"] * 100
+        oneday_daily["accuracy"] = oneday_daily["accuracy"] * 100
 
         fig = go.Figure()
-        fig.add_trace(go.Bar(x=daily["prediction_date"], y=daily["accuracy"],
+        fig.add_trace(go.Bar(x=oneday_daily["prediction_date"], y=oneday_daily["accuracy"],
                              name="的中率", marker_color=[
-                                 "green" if a >= 55 else "red" for a in daily["accuracy"]
+                                 "#4CAF50" if a >= 55 else "#FF9800" if a >= 45 else "#f44336"
+                                 for a in oneday_daily["accuracy"]
                              ]))
         fig.add_hline(y=50, line_dash="dash", line_color="gray", annotation_text="50%ライン（ランダム）")
-        fig.update_layout(yaxis_title="方向的中率(%)", yaxis_range=[0, 100], height=400)
+        fig.update_layout(yaxis_title="方向的中率(%)", yaxis_range=[0, 100], height=350)
         st.plotly_chart(fig, use_container_width=True)
 
 
