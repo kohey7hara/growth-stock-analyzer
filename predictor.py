@@ -1,30 +1,28 @@
 """
-predictor.py - マルチシグナル・アンサンブル株価予測エンジン
+predictor.py - レジーム適応型予測エンジン v4
 
-Dexter/ai-hedge-fund に着想を得た、複数の分析エージェントを統合する方式。
-各エージェントが独立にシグナルを出し、最終的にアンサンブルで予測を生成する。
+v3からの改善ポイント:
+  1. レジーム判定でシグナルの重み付けを動的に変更
+  2. SMAトレンド判定を改善（傾きを考慮）
+  3. オシレーターのトレンド方向フィルター追加
+  4. ボリュームプロファイル分析の追加
+  5. 確信度モデルの改善
 
-エージェント構成:
-  1. テクニカル・エージェント    - RSI/MACD/BB/SMAのテクニカルシグナル
-  2. モメンタム・エージェント    - 短期〜中期のモメンタム分析
-  3. リバーサル・エージェント    - 平均回帰・逆張りシグナル
-  4. ボラティリティ・エージェント - ボラティリティレジーム分析
-  5. トレンド・エージェント      - 統計モデル (ETS/ARIMA/線形回帰)
-
-各エージェントは-100〜+100のスコアと信頼度(0〜1)を返し、
-加重平均でアンサンブルスコアを算出。スコアをリターン予測に変換する。
+根本方針:
+  - v3のファクター構造は維持（実績あり）
+  - レジーム判定をSMAベースで堅牢に（ADXは合成データで不安定）
+  - 「トレンド相場でオシレーター逆張りを抑制」が最重要改善点
+  - トレンド中のRSI売られすぎ→「買い」シグナルを出さない
 """
 
 import pandas as pd
 import numpy as np
 import logging
-from datetime import datetime, timedelta
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).parent
 
-# --- データ取得 ---
 
 def _resolve_ticker(ticker):
     """日本株ティッカーの.T補完"""
@@ -41,445 +39,446 @@ def _fetch_history(ticker, period="2y"):
     import yfinance as yf
     resolved = _resolve_ticker(ticker)
     candidates = [resolved] if resolved == ticker else [resolved, ticker]
-
     for tk in candidates:
-        for p in [period, "1y", "6mo", "3mo"]:
+        for p in [period, "1y", "6mo"]:
             try:
                 hist = yf.Ticker(tk).history(period=p)
-                if not hist.empty and len(hist) >= 20:
+                if not hist.empty and len(hist) >= 30:
                     df = hist[["Close", "High", "Low", "Volume"]].dropna(subset=["Close"])
-                    if len(df) >= 20:
+                    if len(df) >= 30:
                         return df
             except Exception:
                 continue
     return pd.DataFrame()
 
 
-# --- エージェント1: テクニカル分析エージェント ---
+# ==========================================
+# レジーム判定 — SMAベースで堅牢に
+# ==========================================
 
-def _agent_technical(df):
-    """RSI, MACD, ボリンジャーバンド, SMAクロスからシグナルを生成"""
-    close = df["Close"].values
-    n = len(close)
-    if n < 26:
-        return {"score": 0, "confidence": 0.1, "signals": [], "name": "テクニカル"}
+def _detect_regime(close, high, low, volume):
+    """
+    レジーム（相場局面）を判定する。
+    SMAの配置と傾きで判定（ADXより安定）。
 
-    signals = []
-    scores = []
-
-    # RSI (14日)
-    deltas = np.diff(close)
-    gain = np.where(deltas > 0, deltas, 0)
-    loss = np.where(deltas < 0, -deltas, 0)
-    avg_gain = pd.Series(gain).rolling(14).mean().iloc[-1]
-    avg_loss = pd.Series(loss).rolling(14).mean().iloc[-1]
-    rsi = 100 - (100 / (1 + avg_gain / max(avg_loss, 1e-10)))
-
-    if rsi < 30:
-        scores.append(60)  # 売られすぎ → 買いシグナル
-        signals.append(f"RSI={rsi:.0f} 売られすぎ(買)")
-    elif rsi < 40:
-        scores.append(30)
-        signals.append(f"RSI={rsi:.0f} やや低(買)")
-    elif rsi > 70:
-        scores.append(-60)
-        signals.append(f"RSI={rsi:.0f} 買われすぎ(売)")
-    elif rsi > 60:
-        scores.append(-20)
-        signals.append(f"RSI={rsi:.0f} やや高(売)")
-    else:
-        scores.append(0)
-        signals.append(f"RSI={rsi:.0f} 中立")
-
-    # MACD (12, 26, 9)
-    ema12 = pd.Series(close).ewm(span=12).mean().values
-    ema26 = pd.Series(close).ewm(span=26).mean().values
-    macd = ema12 - ema26
-    macd_signal = pd.Series(macd).ewm(span=9).mean().values
-    hist = macd - macd_signal
-
-    if hist[-1] > 0 and hist[-2] <= 0:
-        scores.append(70)
-        signals.append("MACDゴールデンクロス(強い買)")
-    elif hist[-1] < 0 and hist[-2] >= 0:
-        scores.append(-70)
-        signals.append("MACDデッドクロス(強い売)")
-    elif hist[-1] > hist[-2] > 0:
-        scores.append(30)
-        signals.append("MACDプラス圏上昇(買)")
-    elif hist[-1] < hist[-2] < 0:
-        scores.append(-30)
-        signals.append("MACDマイナス圏下降(売)")
-    else:
-        h_trend = hist[-1] - hist[-2]
-        scores.append(int(np.clip(h_trend / max(abs(close[-1]) * 0.001, 1e-10) * 20, -40, 40)))
-        signals.append(f"MACDヒストグラム{'上昇' if h_trend > 0 else '下降'}")
-
-    # ボリンジャーバンド (20日, 2σ)
-    sma20 = pd.Series(close).rolling(20).mean().values[-1]
-    std20 = pd.Series(close).rolling(20).std().values[-1]
-    if std20 > 0:
-        bb_pos = (close[-1] - (sma20 - 2 * std20)) / (4 * std20)  # 0〜1
-        bb_pos = np.clip(bb_pos, 0, 1)
-        if bb_pos < 0.1:
-            scores.append(50)
-            signals.append("BB下限突破(強い買)")
-        elif bb_pos < 0.25:
-            scores.append(25)
-            signals.append("BB下側(買)")
-        elif bb_pos > 0.9:
-            scores.append(-50)
-            signals.append("BB上限突破(強い売)")
-        elif bb_pos > 0.75:
-            scores.append(-25)
-            signals.append("BB上側(売)")
-        else:
-            scores.append(0)
-            signals.append("BB中間")
-
-    # SMAクロス (20日 vs 50日)
-    if n >= 50:
-        sma50 = pd.Series(close).rolling(50).mean().values
-        sma20_arr = pd.Series(close).rolling(20).mean().values
-        if sma20_arr[-1] > sma50[-1] and sma20_arr[-2] <= sma50[-2]:
-            scores.append(60)
-            signals.append("SMA20>50 ゴールデンクロス(買)")
-        elif sma20_arr[-1] < sma50[-1] and sma20_arr[-2] >= sma50[-2]:
-            scores.append(-60)
-            signals.append("SMA20<50 デッドクロス(売)")
-        elif sma20_arr[-1] > sma50[-1]:
-            scores.append(15)
-            signals.append("SMA20>50 上昇トレンド")
-        else:
-            scores.append(-15)
-            signals.append("SMA20<50 下降トレンド")
-
-    avg_score = np.mean(scores) if scores else 0
-    confidence = min(0.9, 0.5 + len(scores) * 0.1)
-
-    return {"score": float(avg_score), "confidence": confidence,
-            "signals": signals, "name": "テクニカル"}
-
-
-# --- エージェント2: モメンタム分析エージェント ---
-
-def _agent_momentum(df):
-    """短期〜中期のモメンタム（価格変動率・出来高トレンド）"""
-    close = df["Close"].values
-    volume = df["Volume"].values
-    n = len(close)
-    if n < 20:
-        return {"score": 0, "confidence": 0.1, "signals": [], "name": "モメンタム"}
-
-    signals = []
-    scores = []
-
-    # 各期間のリターン
-    for days, label, weight in [(5, "1週間", 1.5), (20, "1ヶ月", 1.0), (60, "3ヶ月", 0.7)]:
-        if n > days:
-            ret = (close[-1] / close[-days - 1] - 1) * 100
-            # リターンをスコアに変換（-10%〜+10% → -80〜+80）
-            s = np.clip(ret * 8, -80, 80) * weight
-            scores.append(s)
-            signals.append(f"{label}リターン: {ret:+.1f}%")
-
-    # 出来高トレンド（直近5日 vs 20日平均）
-    if n >= 20:
-        vol_5d = np.mean(volume[-5:])
-        vol_20d = np.mean(volume[-20:])
-        vol_ratio = vol_5d / max(vol_20d, 1)
-        if vol_ratio > 1.5 and close[-1] > close[-5]:
-            scores.append(40)
-            signals.append(f"出来高急増+上昇({vol_ratio:.1f}倍)")
-        elif vol_ratio > 1.5 and close[-1] < close[-5]:
-            scores.append(-40)
-            signals.append(f"出来高急増+下落({vol_ratio:.1f}倍)")
-        elif vol_ratio > 1.2:
-            scores.append(10 if close[-1] > close[-5] else -10)
-            signals.append(f"出来高やや増({vol_ratio:.1f}倍)")
-
-    # 連続上昇/下落
-    streak = 0
-    for i in range(1, min(8, n)):
-        if close[-i] > close[-i - 1]:
-            streak += 1
-        elif close[-i] < close[-i - 1]:
-            streak -= 1
-        else:
-            break
-
-    if abs(streak) >= 3:
-        s = np.clip(streak * 10, -50, 50)
-        scores.append(s)
-        signals.append(f"{'上昇' if streak > 0 else '下落'}{abs(streak)}日連続")
-
-    avg_score = np.mean(scores) if scores else 0
-    return {"score": float(avg_score), "confidence": 0.6,
-            "signals": signals, "name": "モメンタム"}
-
-
-# --- エージェント3: リバーサル（平均回帰）エージェント ---
-
-def _agent_reversal(df):
-    """平均回帰シグナル。大幅乖離時の逆張り"""
-    close = df["Close"].values
+    Returns:
+        regime: "STRONG_TREND", "WEAK_TREND", "RANGE"
+        trend_direction: +1 (上昇), -1 (下落), 0 (不明)
+        strength: 0.0-1.0
+    """
     n = len(close)
     if n < 50:
-        return {"score": 0, "confidence": 0.1, "signals": [], "name": "リバーサル"}
+        return "RANGE", 0, 0.3
 
-    signals = []
+    sma5 = np.mean(close[-5:])
+    sma20 = np.mean(close[-20:])
+    sma50 = np.mean(close[-50:])
+
+    # SMA20の傾き（10日前と比較）
+    sma20_prev = np.mean(close[-30:-10])
+    sma20_slope = (sma20 - sma20_prev) / sma20_prev * 100  # %変化
+
+    # SMA50の傾き（20日前と比較）
+    if n >= 70:
+        sma50_prev = np.mean(close[-70:-20])
+        sma50_slope = (sma50 - sma50_prev) / sma50_prev * 100
+    else:
+        sma50_slope = sma20_slope * 0.5
+
+    # 10日リターンの方向
+    ret_10d = (close[-1] / close[-10] - 1) * 100
+    # 20日リターン
+    ret_20d = (close[-1] / close[-20] - 1) * 100
+
+    # パーフェクトオーダー判定
+    perfect_up = (close[-1] > sma5 > sma20 > sma50)
+    perfect_down = (close[-1] < sma5 < sma20 < sma50)
+
+    # トレンド強度スコア (0-8, より厳密に)
+    trend_score = 0
+
+    # 価格 vs SMA
+    if close[-1] > sma20:
+        trend_score += 1
+    elif close[-1] < sma20:
+        trend_score -= 1
+
+    if sma5 > sma20:
+        trend_score += 1
+    elif sma5 < sma20:
+        trend_score -= 1
+
+    if sma20 > sma50:
+        trend_score += 1
+    elif sma20 < sma50:
+        trend_score -= 1
+
+    # SMA傾き（閾値を厳しく）
+    if abs(sma20_slope) > 3:
+        trend_score += np.sign(sma20_slope) * 1.5
+    elif abs(sma20_slope) > 1.5:
+        trend_score += np.sign(sma20_slope) * 0.5
+
+    if abs(sma50_slope) > 2:
+        trend_score += np.sign(sma50_slope)
+
+    # 直近リターン（閾値を厳しく）
+    if abs(ret_10d) > 5:
+        trend_score += np.sign(ret_10d)
+    if abs(ret_20d) > 8:
+        trend_score += np.sign(ret_20d)
+
+    # 20日ボラティリティ対比リターン（実質的なシャープレシオ）
+    daily_rets = np.diff(close[-21:]) / close[-21:-1]
+    vol_20 = np.std(daily_rets) * 100
+    if vol_20 > 0 and abs(ret_20d) / vol_20 < 0.3:
+        # ボラに対してリターンが小さい → レンジ寄り
+        trend_score *= 0.6
+
+    # 判定（閾値を引き上げ）
+    abs_score = abs(trend_score)
+    direction = 1 if trend_score > 0 else (-1 if trend_score < 0 else 0)
+
+    if (abs_score >= 5 or perfect_up or perfect_down) and abs(ret_20d) > 3:
+        regime = "STRONG_TREND"
+        strength = min(abs_score / 8, 1.0)
+    elif abs_score >= 3:
+        regime = "WEAK_TREND"
+        strength = abs_score / 8
+    else:
+        regime = "RANGE"
+        strength = 0.2
+        direction = 0
+
+    return regime, direction, strength
+
+
+# ==========================================
+# ファクター関数 — 各々 -1.0 〜 +1.0
+# ==========================================
+
+def _factor_trend(close):
+    """F1: トレンドファクター — SMA5/20/50の配置と傾き"""
+    n = len(close)
+    score = 0.0
+
+    # 短期: 終値 vs SMA5
+    if n >= 5:
+        sma5 = np.mean(close[-5:])
+        score += 0.2 if close[-1] > sma5 else -0.2
+
+    # 中期: SMA5 vs SMA20 + SMA5の傾き
+    if n >= 20:
+        sma5 = np.mean(close[-5:])
+        sma20 = np.mean(close[-20:])
+        score += 0.3 if sma5 > sma20 else -0.3
+
+        # SMA5の傾き（方向の加速度）
+        if n >= 10:
+            sma5_prev = np.mean(close[-10:-5])
+            slope = (sma5 - sma5_prev) / sma5_prev * 100
+            score += np.clip(slope / 3, -0.2, 0.2)
+
+    # 長期: SMA20 vs SMA50
+    if n >= 50:
+        sma20 = np.mean(close[-20:])
+        sma50 = np.mean(close[-50:])
+        score += 0.3 if sma20 > sma50 else -0.3
+
+    return np.clip(score, -1.0, 1.0)
+
+
+def _factor_oscillator(close, regime, trend_dir):
+    """
+    F2: オシレーターファクター — RSI + ストキャスティクス
+    ★ v4改善: トレンド方向にフィルタリング
+    強い下落トレンドでRSI低→「買い」を出さない
+    """
+    n = len(close)
+    if n < 14:
+        return 0.0
+
+    # RSI(14)
+    deltas = np.diff(close[-15:])
+    gain = np.mean(np.maximum(deltas, 0))
+    loss = np.mean(np.maximum(-deltas, 0))
+    rsi = 100 - (100 / (1 + gain / max(loss, 1e-10)))
+
+    # 基本RSIスコア
+    if rsi < 25:
+        rsi_score = 0.8
+    elif rsi < 35:
+        rsi_score = 0.4
+    elif rsi < 45:
+        rsi_score = 0.1
+    elif rsi > 75:
+        rsi_score = -0.8
+    elif rsi > 65:
+        rsi_score = -0.4
+    elif rsi > 55:
+        rsi_score = -0.1
+    else:
+        rsi_score = 0.0
+
+    # ★ トレンドフィルター: 強トレンド中の逆張りシグナルを抑制
+    if regime == "STRONG_TREND":
+        if trend_dir < 0 and rsi_score > 0:
+            # 下落トレンド中のRSI買いシグナル → 大幅抑制
+            rsi_score *= 0.1  # ほぼ無効化
+        elif trend_dir > 0 and rsi_score < 0:
+            # 上昇トレンド中のRSI売りシグナル → 大幅抑制
+            rsi_score *= 0.1
+    elif regime == "WEAK_TREND":
+        if trend_dir < 0 and rsi_score > 0:
+            rsi_score *= 0.4  # 弱い抑制
+        elif trend_dir > 0 and rsi_score < 0:
+            rsi_score *= 0.4
+
+    # ストキャスティクス %K
+    if n >= 14:
+        h14 = np.max(close[-14:])
+        l14 = np.min(close[-14:])
+        k = (close[-1] - l14) / max(h14 - l14, 1e-10) * 100
+        if k < 20:
+            stoch_score = 0.5
+        elif k > 80:
+            stoch_score = -0.5
+        else:
+            stoch_score = 0.0
+
+        # 同じトレンドフィルター
+        if regime == "STRONG_TREND":
+            if trend_dir < 0 and stoch_score > 0:
+                stoch_score *= 0.1
+            elif trend_dir > 0 and stoch_score < 0:
+                stoch_score *= 0.1
+    else:
+        stoch_score = 0.0
+
+    return np.clip(rsi_score * 0.6 + stoch_score * 0.4, -1.0, 1.0)
+
+
+def _factor_momentum(close):
+    """F3: モメンタムファクター — ROCベース + 連続性"""
+    n = len(close)
+    if n < 20:
+        return 0.0
+
     scores = []
 
-    # SMA50からの乖離率
-    sma50 = pd.Series(close).rolling(50).mean().values[-1]
-    dev_50 = (close[-1] - sma50) / sma50 * 100
+    # 5日ROC
+    if n > 5:
+        r5 = (close[-1] / close[-6] - 1) * 100
+        scores.append(np.clip(r5 / 5, -1, 1) * 0.35)
 
-    if dev_50 < -15:
-        scores.append(70)
-        signals.append(f"SMA50から{dev_50:.1f}%乖離(強い反発期待)")
-    elif dev_50 < -8:
-        scores.append(40)
-        signals.append(f"SMA50から{dev_50:.1f}%乖離(反発期待)")
-    elif dev_50 > 15:
-        scores.append(-70)
-        signals.append(f"SMA50から+{dev_50:.1f}%乖離(調整警戒)")
-    elif dev_50 > 8:
-        scores.append(-40)
-        signals.append(f"SMA50から+{dev_50:.1f}%乖離(やや過熱)")
-    else:
-        scores.append(0)
-        signals.append(f"SMA50乖離{dev_50:+.1f}%(適正)")
+    # 10日ROC
+    if n > 10:
+        r10 = (close[-1] / close[-11] - 1) * 100
+        scores.append(np.clip(r10 / 8, -1, 1) * 0.35)
 
-    # SMA200からの乖離率
-    if n >= 200:
-        sma200 = pd.Series(close).rolling(200).mean().values[-1]
-        dev_200 = (close[-1] - sma200) / sma200 * 100
-        if dev_200 < -20:
-            scores.append(60)
-            signals.append(f"SMA200から{dev_200:.1f}%乖離(深押し反発)")
-        elif dev_200 > 20:
-            scores.append(-60)
-            signals.append(f"SMA200から+{dev_200:.1f}%乖離(長期過熱)")
-        else:
-            scores.append(int(-dev_200 * 2))
+    # 20日ROC
+    if n > 20:
+        r20 = (close[-1] / close[-21] - 1) * 100
+        scores.append(np.clip(r20 / 12, -1, 1) * 0.30)
 
-    # 52週高値からの下落率
-    high_52w = np.max(close[-min(252, n):])
-    drawdown = (close[-1] - high_52w) / high_52w * 100
-    if drawdown < -40:
-        scores.append(50)
-        signals.append(f"52週高値から{drawdown:.0f}%(大幅調整)")
-    elif drawdown < -20:
-        scores.append(30)
-        signals.append(f"52週高値から{drawdown:.0f}%(調整)")
-    elif drawdown > -5:
-        scores.append(-20)
-        signals.append(f"52週高値近辺({drawdown:.0f}%)")
-
-    avg_score = np.mean(scores) if scores else 0
-    return {"score": float(avg_score), "confidence": 0.5,
-            "signals": signals, "name": "リバーサル"}
+    return np.clip(sum(scores), -1.0, 1.0) if scores else 0.0
 
 
-# --- エージェント4: ボラティリティ・エージェント ---
-
-def _agent_volatility(df):
-    """ボラティリティレジーム分析。高ボラ時は予測信頼度を下げる"""
-    close = df["Close"].values
+def _factor_volume(close, volume):
+    """F4: ボリュームファクター — 出来高と価格の関係"""
     n = len(close)
-    if n < 30:
-        return {"score": 0, "confidence": 0.3, "signals": [], "name": "ボラティリティ"}
+    if n < 20:
+        return 0.0
 
-    signals = []
-    daily_ret = np.diff(close) / close[:-1]
+    # 価格方向
+    price_dir = 1 if close[-1] > close[-5] else -1
 
-    # 直近20日のボラティリティ
-    vol_20 = np.std(daily_ret[-20:]) * np.sqrt(252) * 100  # 年率%
-    # 長期ボラティリティ
-    vol_long = np.std(daily_ret) * np.sqrt(252) * 100
+    # 出来高比率
+    vol_5 = np.mean(volume[-5:])
+    vol_20 = np.mean(volume[-20:])
+    vol_ratio = vol_5 / max(vol_20, 1)
 
-    vol_ratio = vol_20 / max(vol_long, 1)
-
-    score = 0
+    # 高出来高 + 上昇 = 買い確認、高出来高 + 下落 = 売り確認
     if vol_ratio > 1.5:
-        score = -30  # 高ボラ → リスク高
-        signals.append(f"ボラ急上昇({vol_20:.0f}%, 長期比{vol_ratio:.1f}倍)")
+        return np.clip(price_dir * 0.6, -1, 1)
+    elif vol_ratio > 1.2:
+        return np.clip(price_dir * 0.3, -1, 1)
     elif vol_ratio < 0.7:
-        score = 20  # 低ボラ → 安定
-        signals.append(f"ボラ低下({vol_20:.0f}%, 安定局面)")
+        return 0.0  # 出来高減少 = シグナルなし
     else:
-        signals.append(f"ボラ通常({vol_20:.0f}%)")
-
-    # ATR(Average True Range)ベースのレジーム判定
-    if n >= 14:
-        high = df["High"].values
-        low = df["Low"].values
-        tr = np.maximum(high[1:] - low[1:],
-                        np.maximum(abs(high[1:] - close[:-1]),
-                                   abs(low[1:] - close[:-1])))
-        atr_14 = np.mean(tr[-14:])
-        atr_pct = atr_14 / close[-1] * 100
-        if atr_pct > 4:
-            score -= 20
-            signals.append(f"ATR高({atr_pct:.1f}%, 荒れ相場)")
-        elif atr_pct < 1.5:
-            score += 10
-            signals.append(f"ATR低({atr_pct:.1f}%, 穏やか)")
-
-    # ボラが高い時は全体の予測信頼度を下げる
-    confidence = max(0.2, min(0.8, 1.0 - vol_ratio * 0.3))
-
-    return {"score": float(score), "confidence": confidence,
-            "signals": signals, "name": "ボラティリティ"}
+        return np.clip(price_dir * 0.1, -1, 1)
 
 
-# --- エージェント5: トレンド統計エージェント ---
-
-def _agent_trend(df, periods_days):
-    """統計モデルで価格変動率を直接予測 (ETS → ARIMA → 線形回帰)"""
-    close = df["Close"].values
+def _factor_reversion(close, regime, trend_dir):
+    """
+    F5: 回帰ファクター — SMA乖離（逆張り）
+    ★ v4改善: 強トレンド中は回帰シグナルを大幅抑制
+    """
     n = len(close)
-    predictions = {}
+    if n < 20:
+        return 0.0
 
-    # 直近リターンの統計
-    daily_ret = np.diff(close) / close[:-1]
+    sma20 = np.mean(close[-20:])
+    dev = (close[-1] - sma20) / sma20 * 100
 
-    for d in periods_days:
-        # ルックバック: 予測期間の5倍、最低20日
-        lookback = max(20, min(d * 5, n - 1))
-        recent = close[-lookback:]
-        recent_ret = np.diff(recent) / recent[:-1]
+    # 基本の回帰スコア
+    if dev < -10:
+        rev_score = 0.7
+    elif dev < -5:
+        rev_score = 0.3
+    elif dev > 10:
+        rev_score = -0.7
+    elif dev > 5:
+        rev_score = -0.3
+    else:
+        rev_score = 0.0
 
-        # 期間リターンの平均と標準偏差
-        mean_daily = np.mean(recent_ret)
-        std_daily = np.std(recent_ret) if len(recent_ret) > 1 else 0.02
-
-        # トレンド加速度（直近20日 vs その前20日のリターン比較）
-        if n >= 40:
-            r1 = np.mean(daily_ret[-40:-20])  # 前半
-            r2 = np.mean(daily_ret[-20:])      # 後半
-            accel = r2 - r1
+    # ★ トレンドフィルター
+    if regime == "STRONG_TREND":
+        # 強トレンド中: 回帰シグナルをほぼ無効化
+        # 下落トレンドで「売られすぎ→反発」と期待するのは危険
+        if (trend_dir < 0 and rev_score > 0) or (trend_dir > 0 and rev_score < 0):
+            rev_score *= 0.1  # 逆方向の回帰シグナルは90%カット
         else:
-            accel = 0
+            rev_score *= 0.3  # 同方向でも抑制（トレンドフォローに任せる）
+    elif regime == "WEAK_TREND":
+        if (trend_dir < 0 and rev_score > 0) or (trend_dir > 0 and rev_score < 0):
+            rev_score *= 0.3
 
-        # 予測リターン = 日次平均 × 日数 + 加速度項
-        pred_ret = (mean_daily + accel * 0.3) * d * 100  # %
-        # 信頼区間
-        unc = std_daily * np.sqrt(d) * 100
-        predictions[d] = {
-            "pct": float(np.clip(pred_ret, -50, 50)),
-            "l80": float(pred_ret - 1.28 * unc),
-            "u80": float(pred_ret + 1.28 * unc),
-            "l95": float(pred_ret - 1.96 * unc),
-            "u95": float(pred_ret + 1.96 * unc),
-        }
-
-    # スコアは1日後予測の方向性
-    p1 = predictions.get(1, {}).get("pct", 0)
-    score = np.clip(p1 * 20, -80, 80)
-
-    signals = []
-    for d in periods_days:
-        p = predictions[d]["pct"]
-        signals.append(f"{d}日後: {p:+.2f}%")
-
-    return {"score": float(score), "confidence": 0.5,
-            "signals": signals, "name": "トレンド",
-            "predictions": predictions}
+    return np.clip(rev_score, -1.0, 1.0)
 
 
-# --- アンサンブル ---
+def _calc_volatility(close):
+    """ボラティリティ計算"""
+    if len(close) < 20:
+        return 0.02
+    daily_ret = np.diff(close) / close[:-1]
+    vol = np.std(daily_ret[-20:])
+    return max(vol, 0.005)
 
-def _ensemble_predict(agents_results, periods_days, current_price):
+
+# ==========================================
+# 予測コア — レジーム適応型
+# ==========================================
+
+def _predict_direction(close, volume, horizon_days):
     """
-    全エージェントのスコアを加重平均し、リターン予測に変換。
-    Dexterの自己検証に倣い、エージェント間の一致度で信頼度を調整。
+    v3互換のインターフェース（high/lowなしで呼べる）。
+    内部でclose からhigh/lowを推定。
     """
-    # エージェント重み（テクニカルとトレンドを重視）
-    weights = {
-        "テクニカル": 0.30,
-        "モメンタム": 0.20,
-        "リバーサル": 0.15,
-        "ボラティリティ": 0.10,
-        "トレンド": 0.25,
+    # high/lowがない場合はcloseから推定
+    high = close * 1.005  # 簡易推定
+    low = close * 0.995
+    return _predict_direction_full(close, high, low, volume, horizon_days)
+
+
+def _predict_direction_full(close, high, low, volume, horizon_days):
+    """
+    レジーム適応型予測コア。
+
+    改善点:
+    1. レジーム判定を先に行う
+    2. オシレーター/回帰にトレンドフィルターを適用
+    3. レジームに応じてファクター重みを動的変更
+    """
+    # Step 1: レジーム判定
+    regime, trend_dir, strength = _detect_regime(close, high, low, volume)
+
+    # Step 2: 各ファクターを計算（レジーム情報を渡す）
+    f_trend = _factor_trend(close)
+    f_osc = _factor_oscillator(close, regime, trend_dir)  # ★ フィルター付き
+    f_mom = _factor_momentum(close)
+    f_vol = _factor_volume(close, volume)
+    f_rev = _factor_reversion(close, regime, trend_dir)   # ★ フィルター付き
+
+    factors = {
+        "トレンド": f_trend,
+        "オシレーター": f_osc,
+        "モメンタム": f_mom,
+        "ボリューム": f_vol,
+        "回帰": f_rev,
     }
 
-    # スコアの加重平均
-    total_weight = 0
-    ensemble_score = 0
-    agent_scores = []
+    # Step 3: レジーム×ホライズンに応じた重み付け
+    if regime == "STRONG_TREND":
+        # 強トレンド: トレンドフォロー全開
+        if horizon_days <= 1:
+            weights = {"トレンド": 0.35, "オシレーター": 0.05, "モメンタム": 0.35,
+                       "ボリューム": 0.20, "回帰": 0.05}
+        elif horizon_days <= 7:
+            weights = {"トレンド": 0.40, "オシレーター": 0.05, "モメンタム": 0.25,
+                       "ボリューム": 0.15, "回帰": 0.15}
+        else:
+            weights = {"トレンド": 0.30, "オシレーター": 0.10, "モメンタム": 0.15,
+                       "ボリューム": 0.10, "回帰": 0.35}
+    elif regime == "WEAK_TREND":
+        if horizon_days <= 1:
+            weights = {"トレンド": 0.30, "オシレーター": 0.15, "モメンタム": 0.25,
+                       "ボリューム": 0.15, "回帰": 0.15}
+        elif horizon_days <= 7:
+            weights = {"トレンド": 0.30, "オシレーター": 0.15, "モメンタム": 0.15,
+                       "ボリューム": 0.10, "回帰": 0.30}
+        else:
+            weights = {"トレンド": 0.25, "オシレーター": 0.10, "モメンタム": 0.10,
+                       "ボリューム": 0.10, "回帰": 0.45}
+    else:  # RANGE
+        if horizon_days <= 1:
+            weights = {"トレンド": 0.15, "オシレーター": 0.30, "モメンタム": 0.10,
+                       "ボリューム": 0.15, "回帰": 0.30}
+        elif horizon_days <= 7:
+            weights = {"トレンド": 0.15, "オシレーター": 0.25, "モメンタム": 0.05,
+                       "ボリューム": 0.10, "回帰": 0.45}
+        else:
+            weights = {"トレンド": 0.10, "オシレーター": 0.15, "モメンタム": 0.05,
+                       "ボリューム": 0.05, "回帰": 0.65}
 
-    for r in agents_results:
-        w = weights.get(r["name"], 0.1) * r["confidence"]
-        ensemble_score += r["score"] * w
-        total_weight += w
-        agent_scores.append(r["score"])
+    # 加重平均方向スコア
+    direction_score = sum(factors[k] * weights[k] for k in factors)
 
-    if total_weight > 0:
-        ensemble_score /= total_weight
-
-    # エージェント間の一致度（標準偏差が小さい = 一致 = 高信頼）
-    if len(agent_scores) >= 2:
-        agreement = 1.0 - min(1.0, np.std(agent_scores) / 80)
+    # Step 4: 確信度
+    signs = [np.sign(v) for v in factors.values() if abs(v) > 0.05]
+    if len(signs) >= 3:
+        agreement = abs(sum(signs)) / len(signs)
     else:
         agreement = 0.3
 
-    # トレンドエージェントの統計予測をベースに、アンサンブルスコアで調整
-    trend_agent = next((a for a in agents_results if a["name"] == "トレンド"), None)
-    trend_preds = trend_agent.get("predictions", {}) if trend_agent else {}
+    # レジームが明確なほど確信度UP
+    confidence = min(agreement * (0.6 + strength * 0.4), 1.0)
 
-    predictions = []
-    for d in periods_days:
-        tp = trend_preds.get(d)
-        if tp:
-            base_pct = tp["pct"]
-            base_l80 = tp["l80"]
-            base_u80 = tp["u80"]
-            base_l95 = tp["l95"]
-            base_u95 = tp["u95"]
-        else:
-            base_pct = 0
-            base_l80 = base_l95 = -5
-            base_u80 = base_u95 = 5
+    # Step 5: 変動幅の推定
+    vol_daily = _calc_volatility(close)
+    vol_period = vol_daily * np.sqrt(horizon_days)
+    expected_pct = direction_score * vol_period * 100 * 2
 
-        # アンサンブルスコアでベース予測を調整
-        # スコア-100〜+100を日次リターン調整量に変換
-        adjustment = ensemble_score * 0.02 * d  # 1日あたり0.02%ずつ調整
-        adj_pct = base_pct + adjustment
-
-        # 信頼区間も一致度で調整（一致度が高い = 区間狭く）
-        ci_factor = 1.0 + (1.0 - agreement) * 0.5
-        range_80 = (base_u80 - base_l80) * ci_factor / 2
-        range_95 = (base_u95 - base_l95) * ci_factor / 2
-
-        pred_price = current_price * (1 + adj_pct / 100)
-
-        predictions.append({
-            "period_days": d,
-            "return_pct": round(adj_pct, 2),
-            "predicted_price": round(pred_price, 2),
-            "lower_80": round(current_price * (1 + (adj_pct - range_80) / 100), 2),
-            "upper_80": round(current_price * (1 + (adj_pct + range_80) / 100), 2),
-            "lower_80_pct": round(adj_pct - range_80, 2),
-            "upper_80_pct": round(adj_pct + range_80, 2),
-            "lower_95": round(current_price * (1 + (adj_pct - range_95) / 100), 2),
-            "upper_95": round(current_price * (1 + (adj_pct + range_95) / 100), 2),
-            "lower_95_pct": round(adj_pct - range_95, 2),
-            "upper_95_pct": round(adj_pct + range_95, 2),
-            "current_price": current_price,
-        })
+    # 信頼区間
+    unc = vol_period * 100
+    lower_80 = expected_pct - 1.28 * unc
+    upper_80 = expected_pct + 1.28 * unc
+    lower_95 = expected_pct - 1.96 * unc
+    upper_95 = expected_pct + 1.96 * unc
 
     return {
-        "ensemble_score": round(ensemble_score, 1),
-        "agreement": round(agreement, 2),
-        "predictions": predictions,
+        "direction_score": round(direction_score, 3),
+        "confidence": round(confidence, 2),
+        "expected_pct": round(expected_pct, 2),
+        "lower_80": round(lower_80, 2),
+        "upper_80": round(upper_80, 2),
+        "lower_95": round(lower_95, 2),
+        "upper_95": round(upper_95, 2),
+        "regime": regime,
+        "trend_direction": trend_dir,
+        "regime_strength": round(strength, 2),
+        "factors": {k: round(v, 3) for k, v in factors.items()},
+        "volatility": round(vol_daily * 100, 2),
     }
 
 
-# --- メインAPI ---
+# ==========================================
+# 公開API
+# ==========================================
 
 def predict_stock(ticker, periods=None):
-    """マルチエージェント・アンサンブルで銘柄を予測"""
+    """レジーム適応型確率予測"""
     if periods is None:
         periods = [1, 7, 30]
 
@@ -487,45 +486,47 @@ def predict_stock(ticker, periods=None):
     if hist_df.empty:
         return None
 
-    cur = float(hist_df["Close"].iloc[-1])
+    close = hist_df["Close"].values
+    high = hist_df["High"].values
+    low = hist_df["Low"].values
+    volume = hist_df["Volume"].values
+    cur = float(close[-1])
 
-    # 各エージェントを実行
-    agents_results = []
-    try:
-        agents_results.append(_agent_technical(hist_df))
-    except Exception as e:
-        logger.debug(f"テクニカルエージェント失敗 ({ticker}): {e}")
-    try:
-        agents_results.append(_agent_momentum(hist_df))
-    except Exception as e:
-        logger.debug(f"モメンタムエージェント失敗 ({ticker}): {e}")
-    try:
-        agents_results.append(_agent_reversal(hist_df))
-    except Exception as e:
-        logger.debug(f"リバーサルエージェント失敗 ({ticker}): {e}")
-    try:
-        agents_results.append(_agent_volatility(hist_df))
-    except Exception as e:
-        logger.debug(f"ボラティリティエージェント失敗 ({ticker}): {e}")
-    try:
-        agents_results.append(_agent_trend(hist_df, periods))
-    except Exception as e:
-        logger.debug(f"トレンドエージェント失敗 ({ticker}): {e}")
+    predictions = []
+    all_factors = {}
+    regime_info = ""
+    volatility = 2.0
 
-    if not agents_results:
-        return None
+    for d in periods:
+        result = _predict_direction_full(close, high, low, volume, d)
+        pred_price = cur * (1 + result["expected_pct"] / 100)
 
-    # アンサンブル予測
-    result = _ensemble_predict(agents_results, periods, cur)
+        predictions.append({
+            "period_days": d,
+            "return_pct": result["expected_pct"],
+            "predicted_price": round(pred_price, 2),
+            "direction_score": result["direction_score"],
+            "confidence": result["confidence"],
+            "lower_80_pct": result["lower_80"],
+            "upper_80_pct": result["upper_80"],
+            "lower_95_pct": result["lower_95"],
+            "upper_95_pct": result["upper_95"],
+            "current_price": cur,
+        })
+
+        if d == 1:
+            all_factors = result["factors"]
+            volatility = result["volatility"]
+            regime_info = result["regime"]
 
     return {
         "ticker": ticker,
         "current_price": cur,
-        "engine": "ensemble",
-        "ensemble_score": result["ensemble_score"],
-        "agreement": result["agreement"],
-        "agents": agents_results,
-        "predictions": result["predictions"],
+        "engine": "regime_adaptive_v4",
+        "factors": all_factors,
+        "volatility": volatility,
+        "regime": regime_info,
+        "predictions": predictions,
         "history_df": hist_df,
     }
 
@@ -534,30 +535,35 @@ def predict_all_stocks(tickers):
     """全銘柄の予測を実行してDataFrameで返す"""
     periods = [1, 7, 30]
     rows = []
+
     for tk in tickers:
         result = predict_stock(tk, periods)
         if result is None:
             continue
+
         rd = {
             "ticker": tk,
             "pred_engine": result["engine"],
             "pred_current_price": result["current_price"],
-            "ensemble_score": result["ensemble_score"],
-            "agreement": result["agreement"],
+            "volatility": result.get("volatility", 0),
+            "regime": result.get("regime", ""),
         }
 
-        # エージェント別スコア
-        for agent in result.get("agents", []):
-            key = f"agent_{agent['name']}"
-            rd[key] = round(agent["score"], 1)
+        # ファクタースコア
+        for fname, fval in result.get("factors", {}).items():
+            rd[f"factor_{fname}"] = fval
 
+        # 各ホライズンの予測
         for p in result["predictions"]:
             d = p["period_days"]
             rd[f"pred_{d}d_pct"] = p["return_pct"]
+            rd[f"pred_{d}d_dir"] = p["direction_score"]
+            rd[f"pred_{d}d_conf"] = p["confidence"]
             rd[f"pred_{d}d_l80"] = p["lower_80_pct"]
             rd[f"pred_{d}d_u80"] = p["upper_80_pct"]
             rd[f"pred_{d}d_l95"] = p["lower_95_pct"]
             rd[f"pred_{d}d_u95"] = p["upper_95_pct"]
+
         rows.append(rd)
 
     df = pd.DataFrame(rows)
