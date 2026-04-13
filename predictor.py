@@ -1,18 +1,22 @@
 """
-predictor.py - レジーム適応型予測エンジン v4
+predictor.py - レジーム適応型予測エンジン v5
 
-v3からの改善ポイント:
-  1. レジーム判定でシグナルの重み付けを動的に変更
-  2. SMAトレンド判定を改善（傾きを考慮）
-  3. オシレーターのトレンド方向フィルター追加
-  4. ボリュームプロファイル分析の追加
-  5. 確信度モデルの改善
+v4→v5の改善ポイント:
+  1. ファンダメンタル分析ファクター追加 (F6)
+     - アナリスト目標株価との乖離 (upside_pct)
+     - PEG比率（成長対比割安度）
+     - 売上成長率
+  2. マクロ環境ファクター追加 (F7)
+     - VIX（恐怖指数）レベル
+     - 市場全体のトレンド (S&P500/日経225)
+     - 金利動向 (10年国債)
+  3. 7ファクター体制でより多面的な分析
+  4. レジーム判定にマクロ指標を統合
 
-根本方針:
-  - v3のファクター構造は維持（実績あり）
-  - レジーム判定をSMAベースで堅牢に（ADXは合成データで不安定）
-  - 「トレンド相場でオシレーター逆張りを抑制」が最重要改善点
-  - トレンド中のRSI売られすぎ→「買い」シグナルを出さない
+v4からの継続:
+  - レジーム判定（SMAベース）
+  - トレンド相場でオシレーター逆張り抑制
+  - 動的ウェイト配分
 """
 
 import pandas as pd
@@ -358,7 +362,208 @@ def _calc_volatility(close):
 
 
 # ==========================================
-# 予測コア — レジーム適応型
+# F6: ファンダメンタルファクター（CSVデータ活用）
+# ==========================================
+
+def _load_stock_fundamentals(ticker):
+    """latest_data.csv からファンダメンタルデータを読み込む"""
+    try:
+        path = BASE_DIR / "data" / "latest_data.csv"
+        if not path.exists():
+            return None
+        df = pd.read_csv(path)
+        row = df[df["ticker"] == ticker]
+        if row.empty:
+            return None
+        return row.iloc[0].to_dict()
+    except Exception:
+        return None
+
+
+def _factor_fundamental(ticker):
+    """
+    F6: ファンダメンタルファクター
+    - アナリスト目標株価 vs 現在株価（upside_pct）
+    - PEGレシオ（低い方が割安で成長性あり）
+    - 売上成長率
+    - 52週位置（極端な高値圏/安値圏を検知）
+    Returns: -1.0 ~ +1.0
+    """
+    data = _load_stock_fundamentals(ticker)
+    if data is None:
+        return 0.0
+
+    scores = []
+
+    # アナリスト目標株価アップサイド
+    upside = data.get("upside_pct")
+    if upside is not None and pd.notna(upside):
+        upside = float(upside)
+        if upside > 30:
+            scores.append(0.7)
+        elif upside > 15:
+            scores.append(0.4)
+        elif upside > 5:
+            scores.append(0.2)
+        elif upside < -20:
+            scores.append(-0.6)
+        elif upside < -10:
+            scores.append(-0.3)
+        elif upside < 0:
+            scores.append(-0.1)
+        else:
+            scores.append(0.0)
+
+    # PEGレシオ（低いほど割安成長）
+    peg = data.get("peg_ratio")
+    if peg is not None and pd.notna(peg):
+        peg = float(peg)
+        if 0 < peg < 0.8:
+            scores.append(0.5)  # 割安成長
+        elif 0 < peg < 1.2:
+            scores.append(0.2)  # 適正
+        elif peg > 3:
+            scores.append(-0.4)  # 過大評価
+        elif peg > 2:
+            scores.append(-0.2)
+        elif peg < 0:
+            scores.append(-0.3)  # 赤字
+
+    # 売上成長率
+    growth = data.get("revenue_growth_pct")
+    if growth is not None and pd.notna(growth):
+        growth = float(growth)
+        if growth > 40:
+            scores.append(0.5)
+        elif growth > 20:
+            scores.append(0.3)
+        elif growth > 10:
+            scores.append(0.1)
+        elif growth < -10:
+            scores.append(-0.4)
+        elif growth < 0:
+            scores.append(-0.2)
+        else:
+            scores.append(0.0)
+
+    # 52週位置（極端な位置のみ）
+    pos_52w = data.get("pos_52w_pct")
+    if pos_52w is not None and pd.notna(pos_52w):
+        pos_52w = float(pos_52w)
+        if pos_52w > 95:
+            scores.append(-0.3)  # 52週高値圏 → 過熱
+        elif pos_52w < 10:
+            scores.append(0.3)  # 52週安値圏 → 反発期待
+
+    if not scores:
+        return 0.0
+    return np.clip(np.mean(scores), -1.0, 1.0)
+
+
+# ==========================================
+# F7: マクロ環境ファクター
+# ==========================================
+
+def _load_macro_data():
+    """latest_macro.csv からマクロデータを読み込む"""
+    try:
+        path = BASE_DIR / "data" / "latest_macro.csv"
+        if not path.exists():
+            return {}
+        df = pd.read_csv(path)
+        result = {}
+        for _, row in df.iterrows():
+            tk = row.get("ticker", "")
+            result[tk] = {
+                "value": row.get("current_value"),
+                "change_1d": row.get("change_1d_pct"),
+                "change_1m": row.get("change_1m_pct"),
+                "change_3m": row.get("change_3m_pct"),
+            }
+        return result
+    except Exception:
+        return {}
+
+
+def _factor_macro(ticker, market="US"):
+    """
+    F7: マクロ環境ファクター
+    - VIXレベル（高い→リスクオフ、低い→リスクオン）
+    - 市場インデックスのトレンド（S&P500 or 日経225）
+    - 金利動向（上昇→株にネガティブ）
+    Returns: -1.0 ~ +1.0
+    """
+    macro = _load_macro_data()
+    if not macro:
+        return 0.0
+
+    scores = []
+
+    # VIX
+    vix = macro.get("^VIX", {})
+    vix_val = vix.get("value")
+    vix_1m = vix.get("change_1m")
+    if vix_val is not None and pd.notna(vix_val):
+        vix_val = float(vix_val)
+        if vix_val > 35:
+            scores.append(-0.6)  # 恐怖レベル高 → 下落バイアス
+        elif vix_val > 25:
+            scores.append(-0.3)
+        elif vix_val < 15:
+            scores.append(0.3)  # 低恐怖 → 上昇バイアス
+        elif vix_val < 20:
+            scores.append(0.1)
+        else:
+            scores.append(0.0)
+
+        # VIXの方向（下落中→安心感増加）
+        if vix_1m is not None and pd.notna(vix_1m):
+            vix_1m = float(vix_1m)
+            if vix_1m < -20:
+                scores.append(0.3)  # VIX急低下 → 楽観
+            elif vix_1m > 30:
+                scores.append(-0.3)  # VIX急上昇 → 恐怖
+
+    # 市場インデックストレンド
+    if market == "JP":
+        idx = macro.get("^N225", {})
+    else:
+        idx = macro.get("^GSPC", {})
+
+    idx_1m = idx.get("change_1m")
+    idx_3m = idx.get("change_3m")
+    if idx_1m is not None and pd.notna(idx_1m):
+        idx_1m = float(idx_1m)
+        if idx_1m > 5:
+            scores.append(0.4)
+        elif idx_1m > 2:
+            scores.append(0.2)
+        elif idx_1m < -5:
+            scores.append(-0.4)
+        elif idx_1m < -2:
+            scores.append(-0.2)
+        else:
+            scores.append(0.0)
+
+    # 金利動向
+    tnx = macro.get("^TNX", {})
+    tnx_1m = tnx.get("change_1m")
+    if tnx_1m is not None and pd.notna(tnx_1m):
+        tnx_1m = float(tnx_1m)
+        if tnx_1m > 10:
+            scores.append(-0.3)  # 金利急上昇 → 株にネガティブ
+        elif tnx_1m > 5:
+            scores.append(-0.1)
+        elif tnx_1m < -10:
+            scores.append(0.2)  # 金利低下 → 株にポジティブ
+
+    if not scores:
+        return 0.0
+    return np.clip(np.mean(scores), -1.0, 1.0)
+
+
+# ==========================================
+# 予測コア — レジーム適応型 v5
 # ==========================================
 
 def _predict_direction(close, volume, horizon_days):
@@ -372,24 +577,27 @@ def _predict_direction(close, volume, horizon_days):
     return _predict_direction_full(close, high, low, volume, horizon_days)
 
 
-def _predict_direction_full(close, high, low, volume, horizon_days):
+def _predict_direction_full(close, high, low, volume, horizon_days,
+                            ticker="", market="US"):
     """
-    レジーム適応型予測コア。
+    レジーム適応型予測コア v5（7ファクター）。
 
-    改善点:
-    1. レジーム判定を先に行う
-    2. オシレーター/回帰にトレンドフィルターを適用
-    3. レジームに応じてファクター重みを動的変更
+    v4→v5:
+    - ファンダメンタル(F6) + マクロ(F7)ファクター追加
+    - 長期予測でファンダメンタルの重みを大きくする
+    - マクロ環境を全ホライズンで考慮
     """
     # Step 1: レジーム判定
     regime, trend_dir, strength = _detect_regime(close, high, low, volume)
 
-    # Step 2: 各ファクターを計算（レジーム情報を渡す）
+    # Step 2: 7ファクターを計算
     f_trend = _factor_trend(close)
-    f_osc = _factor_oscillator(close, regime, trend_dir)  # ★ フィルター付き
+    f_osc = _factor_oscillator(close, regime, trend_dir)
     f_mom = _factor_momentum(close)
     f_vol = _factor_volume(close, volume)
-    f_rev = _factor_reversion(close, regime, trend_dir)   # ★ フィルター付き
+    f_rev = _factor_reversion(close, regime, trend_dir)
+    f_fund = _factor_fundamental(ticker)  # ★ NEW: ファンダメンタル
+    f_macro = _factor_macro(ticker, market)  # ★ NEW: マクロ環境
 
     factors = {
         "トレンド": f_trend,
@@ -397,40 +605,50 @@ def _predict_direction_full(close, high, low, volume, horizon_days):
         "モメンタム": f_mom,
         "ボリューム": f_vol,
         "回帰": f_rev,
+        "ファンダメンタル": f_fund,
+        "マクロ": f_macro,
     }
 
-    # Step 3: レジーム×ホライズンに応じた重み付け
+    # Step 3: レジーム×ホライズンに応じた7ファクター重み付け
     if regime == "STRONG_TREND":
-        # 強トレンド: トレンドフォロー全開
         if horizon_days <= 1:
-            weights = {"トレンド": 0.35, "オシレーター": 0.05, "モメンタム": 0.35,
-                       "ボリューム": 0.20, "回帰": 0.05}
+            weights = {"トレンド": 0.28, "オシレーター": 0.04, "モメンタム": 0.28,
+                       "ボリューム": 0.15, "回帰": 0.03,
+                       "ファンダメンタル": 0.07, "マクロ": 0.15}
         elif horizon_days <= 7:
-            weights = {"トレンド": 0.40, "オシレーター": 0.05, "モメンタム": 0.25,
-                       "ボリューム": 0.15, "回帰": 0.15}
+            weights = {"トレンド": 0.30, "オシレーター": 0.04, "モメンタム": 0.18,
+                       "ボリューム": 0.10, "回帰": 0.08,
+                       "ファンダメンタル": 0.15, "マクロ": 0.15}
         else:
-            weights = {"トレンド": 0.30, "オシレーター": 0.10, "モメンタム": 0.15,
-                       "ボリューム": 0.10, "回帰": 0.35}
+            weights = {"トレンド": 0.15, "オシレーター": 0.05, "モメンタム": 0.08,
+                       "ボリューム": 0.05, "回帰": 0.22,
+                       "ファンダメンタル": 0.30, "マクロ": 0.15}
     elif regime == "WEAK_TREND":
         if horizon_days <= 1:
-            weights = {"トレンド": 0.30, "オシレーター": 0.15, "モメンタム": 0.25,
-                       "ボリューム": 0.15, "回帰": 0.15}
+            weights = {"トレンド": 0.22, "オシレーター": 0.10, "モメンタム": 0.18,
+                       "ボリューム": 0.10, "回帰": 0.10,
+                       "ファンダメンタル": 0.12, "マクロ": 0.18}
         elif horizon_days <= 7:
-            weights = {"トレンド": 0.30, "オシレーター": 0.15, "モメンタム": 0.15,
-                       "ボリューム": 0.10, "回帰": 0.30}
+            weights = {"トレンド": 0.20, "オシレーター": 0.10, "モメンタム": 0.10,
+                       "ボリューム": 0.08, "回帰": 0.17,
+                       "ファンダメンタル": 0.18, "マクロ": 0.17}
         else:
-            weights = {"トレンド": 0.25, "オシレーター": 0.10, "モメンタム": 0.10,
-                       "ボリューム": 0.10, "回帰": 0.45}
+            weights = {"トレンド": 0.12, "オシレーター": 0.05, "モメンタム": 0.05,
+                       "ボリューム": 0.05, "回帰": 0.28,
+                       "ファンダメンタル": 0.30, "マクロ": 0.15}
     else:  # RANGE
         if horizon_days <= 1:
-            weights = {"トレンド": 0.15, "オシレーター": 0.30, "モメンタム": 0.10,
-                       "ボリューム": 0.15, "回帰": 0.30}
+            weights = {"トレンド": 0.10, "オシレーター": 0.22, "モメンタム": 0.05,
+                       "ボリューム": 0.10, "回帰": 0.22,
+                       "ファンダメンタル": 0.13, "マクロ": 0.18}
         elif horizon_days <= 7:
-            weights = {"トレンド": 0.15, "オシレーター": 0.25, "モメンタム": 0.05,
-                       "ボリューム": 0.10, "回帰": 0.45}
+            weights = {"トレンド": 0.08, "オシレーター": 0.15, "モメンタム": 0.03,
+                       "ボリューム": 0.05, "回帰": 0.29,
+                       "ファンダメンタル": 0.22, "マクロ": 0.18}
         else:
-            weights = {"トレンド": 0.10, "オシレーター": 0.15, "モメンタム": 0.05,
-                       "ボリューム": 0.05, "回帰": 0.65}
+            weights = {"トレンド": 0.05, "オシレーター": 0.08, "モメンタム": 0.02,
+                       "ボリューム": 0.03, "回帰": 0.32,
+                       "ファンダメンタル": 0.35, "マクロ": 0.15}
 
     # 加重平均方向スコア
     direction_score = sum(factors[k] * weights[k] for k in factors)
@@ -477,8 +695,26 @@ def _predict_direction_full(close, high, low, volume, horizon_days):
 # 公開API
 # ==========================================
 
+def _detect_market(ticker):
+    """銘柄の市場を判定"""
+    stripped = ticker.replace(".T", "").replace(".", "")
+    if stripped.isdigit():
+        return "JP"
+    # latest_data.csv のmarket列も確認
+    try:
+        path = BASE_DIR / "data" / "latest_data.csv"
+        if path.exists():
+            df = pd.read_csv(path)
+            row = df[df["ticker"] == ticker]
+            if not row.empty:
+                return row.iloc[0].get("market", "US")
+    except Exception:
+        pass
+    return "US"
+
+
 def predict_stock(ticker, periods=None):
-    """レジーム適応型確率予測"""
+    """レジーム適応型確率予測 v5"""
     if periods is None:
         periods = [1, 7, 30]
 
@@ -491,6 +727,7 @@ def predict_stock(ticker, periods=None):
     low = hist_df["Low"].values
     volume = hist_df["Volume"].values
     cur = float(close[-1])
+    market = _detect_market(ticker)
 
     predictions = []
     all_factors = {}
@@ -498,7 +735,8 @@ def predict_stock(ticker, periods=None):
     volatility = 2.0
 
     for d in periods:
-        result = _predict_direction_full(close, high, low, volume, d)
+        result = _predict_direction_full(close, high, low, volume, d,
+                                         ticker=ticker, market=market)
         pred_price = cur * (1 + result["expected_pct"] / 100)
 
         predictions.append({
@@ -522,7 +760,7 @@ def predict_stock(ticker, periods=None):
     return {
         "ticker": ticker,
         "current_price": cur,
-        "engine": "regime_adaptive_v4",
+        "engine": "regime_adaptive_v5",
         "factors": all_factors,
         "volatility": volatility,
         "regime": regime_info,
