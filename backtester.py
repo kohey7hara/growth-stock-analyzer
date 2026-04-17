@@ -127,22 +127,25 @@ def from_yf_symbol(yf_symbol):
 def fetch_historical_ohlcv(tickers, period="5y", use_cache=True, cache_days=1):
     """全銘柄のOHLCVを取得し、long format DataFrame を返す
 
-    - キャッシュ: data/backtest_cache/ohlcv_{period}_{YYYYMMDD}.parquet
+    - キャッシュ: data/backtest_cache/ohlcv_{period}_{ticker_hash}_{YYYYMMDD}.parquet
     - cache_days=1: 1日以内のキャッシュは再利用
+    - v2修正(2026-04-17): ticker_hash をキーに追加（ユニバース変更時のキャッシュ誤ヒット防止）
     """
     import yfinance as yf
+    import hashlib as _hl
 
-    # キャッシュキー
+    # キャッシュキー: tickers の内容もハッシュに含めてユニバース別にキャッシュ分離
+    ticker_hash = _hl.md5(",".join(sorted(tickers)).encode()).hexdigest()[:10]
     today = datetime.now().strftime("%Y%m%d")
-    cache_file = CACHE_DIR / f"ohlcv_{period}_{today}.parquet"
+    cache_file = CACHE_DIR / f"ohlcv_{period}_{ticker_hash}_{today}.parquet"
 
     if use_cache and cache_file.exists():
         logger.info(f"Cache hit: {cache_file.name}")
         return pd.read_parquet(cache_file)
 
-    # 古いキャッシュも許容（前日）
+    # 古いキャッシュも許容（前日まで。ticker_hash 一致のみ）
     if use_cache:
-        for f in sorted(CACHE_DIR.glob(f"ohlcv_{period}_*.parquet"), reverse=True):
+        for f in sorted(CACHE_DIR.glob(f"ohlcv_{period}_{ticker_hash}_*.parquet"), reverse=True):
             age = datetime.now() - datetime.fromtimestamp(f.stat().st_mtime)
             if age.days < cache_days:
                 logger.info(f"Cache hit (aged): {f.name}")
@@ -470,6 +473,13 @@ def run_backtest(
         tickers = get_default_tickers()
     if ohlcv is None:
         ohlcv = fetch_historical_ohlcv(tickers, period=period)
+
+    # v2修正(2026-04-17): 指定された tickers で OHLCV をフィルタ
+    # （キャッシュに他のユニバースのデータが混在していても安全）
+    ticker_set = set(tickers)
+    ohlcv = ohlcv[ohlcv["ticker"].isin(ticker_set)].copy()
+    if ohlcv.empty:
+        raise RuntimeError(f"指定ユニバースに合致するOHLCVデータがありません。tickers={len(tickers)}, ohlcv銘柄数=0")
 
     # 戦略確定
     if strategy not in SCORING_STRATEGIES:
