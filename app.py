@@ -396,6 +396,46 @@ def _signal_action(signal, score, hybrid):
     return ("⚪ 様子見／指値待ち", "rgba(150,150,150,0.10)")
 
 
+def _effective_probability(model_prob, hit_rate_pct):
+    """モデルの上昇確率を過去的中率で補正した『実効上昇確率』を算出
+
+    calibration_strength = 2 * h - 1   （-1..+1, 50%で0）
+    effective = 0.5 + (model_prob - 0.5) * calibration_strength
+    ・h=50%（ランダム）→ effective は常に50%（モデルに情報価値なし）
+    ・h>50%（モデルに edge あり）→ edge に応じてスケール
+    ・h<50%（モデルが反相関）→ バイアスを反転
+    """
+    if model_prob is None or pd.isna(model_prob) or hit_rate_pct is None:
+        return None
+    h = float(hit_rate_pct) / 100
+    strength = 2 * h - 1
+    edge = float(model_prob) - 0.5
+    return 0.5 + edge * strength
+
+
+def _prob_color(eff_prob):
+    """実効上昇確率に応じた色"""
+    if eff_prob is None or pd.isna(eff_prob):
+        return "#888"
+    p = float(eff_prob)
+    if p >= 0.60:
+        return "#27ae60"  # green
+    if p >= 0.50:
+        return "#f39c12"  # orange
+    return "#e74c3c"      # red
+
+
+def _hit_rate_badge(hit_rate):
+    """過去的中率に応じたバッジ文言と色"""
+    if hit_rate is None:
+        return ("-", "#888")
+    if hit_rate >= 55:
+        return (f"{hit_rate:.0f}% ✅ 実用水準", "#27ae60")
+    if hit_rate >= 50:
+        return (f"{hit_rate:.0f}% ⚠️ ランダムに近い", "#f39c12")
+    return (f"{hit_rate:.0f}% ❌ 参考値以下", "#e74c3c")
+
+
 def page_recommend():
     st.header("💎 今買うべき銘柄 TOP10")
     st.caption("スコア × 予測ハイブリッドで並び替えた、中期で最も買い妙味のある10銘柄。1日/1週/1ヶ月後の期待変化率・上昇確率・80%信頼区間つき。")
@@ -410,13 +450,30 @@ def page_recommend():
         st.warning("予測データ (latest_predictions.csv) がありません。`python run.py` を実行してください。")
         return
 
-    # データ最新時刻
+    # ── データ鮮度バッジ ──
     try:
         from datetime import datetime as _dt, timezone as _tz, timedelta as _td
         _latest = pd.to_datetime(df["analysis_time"]).max()
         _jst = _tz(_td(hours=9))
-        _updated = _latest.tz_localize("UTC").astimezone(_jst).strftime("%Y/%m/%d %H:%M:%S")
-        st.caption(f"🕐 データ最終更新: {_updated} (JST)")
+        _updated = _latest.tz_localize("UTC").astimezone(_jst)
+        _now = _dt.now(_jst)
+        _delta_hours = (_now - _updated).total_seconds() / 3600
+
+        if _delta_hours < 24:
+            b_color, b_icon, b_msg = "#27ae60", "✅", f"{_delta_hours:.1f}時間前（最新）"
+        elif _delta_hours < 48:
+            b_color, b_icon, b_msg = "#f39c12", "ℹ️", f"{_delta_hours:.1f}時間前"
+        elif _delta_hours < 72:
+            b_color, b_icon, b_msg = "#f39c12", "⚠️", f"約{_delta_hours/24:.1f}日前"
+        else:
+            b_color, b_icon, b_msg = "#e74c3c", "🚨", f"約{_delta_hours/24:.1f}日前（要確認）"
+
+        st.markdown(f"""
+<div style="background:rgba({255 if _delta_hours>=48 else 0},{255 if _delta_hours<48 else 0},0,0.05);
+            border-left:4px solid {b_color};padding:8px 14px;border-radius:4px;margin:4px 0 12px 0;font-size:13px">
+  {b_icon} <b>データ最終更新:</b> {_updated.strftime("%Y/%m/%d %H:%M")} (JST) — {b_msg}
+</div>
+""", unsafe_allow_html=True)
     except Exception:
         pass
 
@@ -471,23 +528,42 @@ def page_recommend():
         st.warning("推奨できる銘柄が見つかりませんでした。")
         return
 
-    # サイドバー: 過去的中率
+    # ── 過去の方向的中率（モデル成績表） ──
     rates = _historical_hit_rates()
-    if rates:
-        st.sidebar.markdown("**📊 過去の方向的中率**")
-        for d, lab in [(1,"1日"), (7,"1週"), (30,"1ヶ月")]:
-            if d in rates:
-                st.sidebar.caption(f"{lab}: {rates[d]:.1f}%")
-        st.sidebar.caption("※ 50%がランダム、55%↑で良好")
 
-    # 凡例
-    st.markdown("""
-<div style="background:rgba(255,255,255,0.05);border-radius:8px;padding:10px 14px;font-size:12px;line-height:1.7;margin:4px 0 16px 0">
-<b>📖 読み方:</b> ハイブリッドスコア = 総合スコア(アナライザー) × 0.5 + 7日後期待値(予測×上昇確率) × 0.5 <br>
-<b>上昇確率</b> = 95%信頼区間から正規分布を仮定して算出したP(変化率&gt;0) <br>
-<b>80%信頼区間</b> = 10回中8回はこの範囲に収まる見込み
+    with st.expander("📖 このページの読み方（重要）", expanded=False):
+        st.markdown("""
+**ハイブリッドスコア** = 総合スコア × 0.5 + 1週後期待値（予測%×上昇確率）× 0.5
+
+**3種類の「確率」を使い分けます:**
+- **上昇確率** — モデルが今回の予測から算出した「ロジック上の確率」。最高99%まで出ることも
+- **過去的中率** — モデルの過去成績（方向↑↓を何%当てたか）。下の表を参照
+- **実効上昇確率 🎯** — 上昇確率を過去的中率で補正した**信頼できる見積もり**。これを主に見る
+
+**信頼区間の読み方:**
+- **80%信頼区間 [-0.4% 〜 +9.9%]** → 10回中8回はこの範囲に収まる見込み
+- 幅が広い = 予測困難／幅が狭い = 予測しやすい相場
+- 1ヶ月の区間が [-18% 〜 +37%] のように広い場合、期待値がプラスでも下振れリスクが大きい
+""")
+
+    # 過去的中率テーブル（本編）
+    if rates:
+        cols = st.columns(3)
+        for col, (d, lab) in zip(cols, [(1,"1日後"), (7,"1週後"), (30,"1ヶ月後")]):
+            h = rates.get(d)
+            if h is None:
+                col.metric(lab + " 的中率", "-")
+                continue
+            badge_text, badge_color = _hit_rate_badge(h)
+            col.markdown(f"""
+<div style="border-left:4px solid {badge_color};padding:8px 12px;background:rgba(255,255,255,0.03);border-radius:4px">
+  <div style="font-size:12px;color:#aaa">{lab} 方向的中率</div>
+  <div style="font-size:22px;font-weight:bold;color:{badge_color}">{h:.0f}%</div>
+  <div style="font-size:11px;color:{badge_color}">{badge_text.split(' ',1)[1] if ' ' in badge_text else ''}</div>
 </div>
 """, unsafe_allow_html=True)
+        st.caption("💡 的中率50%=コイン投げ同等／55%以上で実用／50%未満は『モデルを信じない』が正解。")
+        st.markdown("")
 
     # 各銘柄カード
     for i, row in top.iterrows():
@@ -533,30 +609,48 @@ def page_recommend():
 
         cA, cB = st.columns([3, 2])
 
-        # 左: 予測テーブル
+        # 左: 予測テーブル（HTMLで色分け）
         with cA:
             st.markdown("**📈 期間別予測**")
-            pred_rows = []
-            for d, lab, hist_key in [(1,"1日後",1), (7,"1週間後",7), (30,"1ヶ月後",30)]:
+            html = ['<table style="width:100%;font-size:13px;border-collapse:collapse">']
+            html.append("""
+<thead><tr style="background:rgba(255,255,255,0.06);text-align:left">
+<th style="padding:6px 8px">期間</th>
+<th style="padding:6px 8px">期待変化率</th>
+<th style="padding:6px 8px">予想株価</th>
+<th style="padding:6px 8px">上昇確率<br><span style='font-size:10px;color:#888'>(モデル)</span></th>
+<th style="padding:6px 8px">🎯 実効上昇確率<br><span style='font-size:10px;color:#888'>(過去的中率で補正)</span></th>
+<th style="padding:6px 8px">80%信頼区間</th>
+</tr></thead><tbody>
+""")
+            for d, lab in [(1,"1日後"), (7,"1週間後"), (30,"1ヶ月後")]:
                 pct = row.get(f"pred_{d}d_pct")
                 prob = row.get(f"prob_{d}d")
                 l80 = row.get(f"pred_{d}d_l80")
                 u80 = row.get(f"pred_{d}d_u80")
-                hist = rates.get(hist_key, None)
+                hist = rates.get(d, None)
                 if pd.isna(pct):
                     continue
                 pred_price = price * (1 + pct/100)
-                prob_str = f"{prob*100:.1f}%" if prob is not None and not pd.isna(prob) else "-"
-                hist_str = f" (過去的中率 {hist:.0f}%)" if hist is not None else ""
-                pred_rows.append({
-                    "期間": lab,
-                    "期待変化率": f"{pct:+.2f}%",
-                    "予想株価": f"{pred_price:,.2f}",
-                    "上昇確率": prob_str + hist_str,
-                    "80%信頼区間": f"[{l80:+.2f}% 〜 {u80:+.2f}%]",
-                })
-            if pred_rows:
-                st.dataframe(pd.DataFrame(pred_rows), hide_index=True, width="stretch")
+                prob_str = f"{prob*100:.0f}%" if prob is not None and not pd.isna(prob) else "-"
+                eff = _effective_probability(prob, hist)
+                eff_color = _prob_color(eff)
+                eff_str = f"<span style='color:{eff_color};font-weight:bold'>{eff*100:.0f}%</span>" if eff is not None else "-"
+                pct_color = "#27ae60" if pct >= 0 else "#e74c3c"
+                # 80%信頼区間: 下限がマイナスなら赤で強調
+                ci_lower_color = "#e74c3c" if (pd.notna(l80) and l80 < -5) else "#aaa"
+                html.append(f"""
+<tr style="border-top:1px solid rgba(255,255,255,0.08)">
+<td style="padding:6px 8px">{lab}</td>
+<td style="padding:6px 8px;color:{pct_color};font-weight:bold">{pct:+.2f}%</td>
+<td style="padding:6px 8px">{pred_price:,.2f}</td>
+<td style="padding:6px 8px;color:#aaa">{prob_str}</td>
+<td style="padding:6px 8px;font-size:14px">{eff_str}</td>
+<td style="padding:6px 8px;color:{ci_lower_color};font-size:12px">[{l80:+.2f}% 〜 {u80:+.2f}%]</td>
+</tr>
+""")
+            html.append("</tbody></table>")
+            st.markdown("".join(html), unsafe_allow_html=True)
 
         # 右: 選出理由
         with cB:
