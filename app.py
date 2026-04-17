@@ -941,19 +941,25 @@ def page_accuracy():
 # ──────────────────────────────────────────────
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def _cached_backtest(period, rebalance_freq, top_n, initial_capital, ticker_sig):
+def _cached_backtest(
+    period, rebalance_freq, top_n, initial_capital,
+    universe_key, strategy, ticker_sig,
+    take_profit, stop_loss, trailing_stop,
+):
     """OHLCV取得 + バックテストを1日キャッシュ"""
     from backtester import (
-        get_default_tickers, fetch_historical_ohlcv, run_backtest,
+        UNIVERSE_OPTIONS, fetch_historical_ohlcv, run_backtest,
         benchmark_equity_curve,
     )
-    tickers = get_default_tickers()
+    tickers = UNIVERSE_OPTIONS[universe_key]["fn"]()
     ohlcv = fetch_historical_ohlcv(tickers, period=period)
     result = run_backtest(
         tickers=tickers, period=period, rebalance_freq=rebalance_freq,
         top_n=top_n, initial_capital=initial_capital, ohlcv=ohlcv,
+        strategy=strategy,
+        take_profit_pct=take_profit, stop_loss_pct=stop_loss,
+        trailing_stop_pct=trailing_stop,
     )
-    # ベンチマーク
     bench = {}
     for sym, label in [("SPY", "S&P500 (SPY)"), ("^N225", "日経225")]:
         try:
@@ -964,35 +970,81 @@ def _cached_backtest(period, rebalance_freq, top_n, initial_capital, ticker_sig)
 
 
 def page_backtest():
-    st.header("📉 バックテスト（TOP10戦略の過去検証）")
-    st.caption("テクニカルのみのスコアで毎期TOP10を選び、等金額保有してリバランスする戦略を過去期間でシミュレーション。取引コスト往復10bp（0.10%）を控除。")
+    from backtester import SCORING_STRATEGIES, UNIVERSE_OPTIONS
 
-    # 設定UI
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        period = st.selectbox("バックテスト期間", ["1y", "3y", "5y"], index=2,
-                              help="yfinanceから取得。長いほど初回数分かかる")
-    with c2:
-        freq_display = st.selectbox("リバランス頻度", ["両方（比較）", "毎週（W-FRI）", "毎月（末日）"])
-    with c3:
-        top_n = st.number_input("保有銘柄数 (TOP N)", min_value=3, max_value=30, value=10)
-    with c4:
-        initial_capital = st.number_input("初期資金 (円)", min_value=10000, value=1_000_000, step=100_000)
+    st.header("📉 バックテスト（TOP N戦略の過去検証）")
+    st.caption("テクニカルのみのスコアで毎期TOP Nを選び、等金額保有してリバランスする戦略を過去期間でシミュレーション。取引コスト往復10bp（0.10%）を控除。")
 
-    st.caption("💡 初回実行は5年分のOHLCVをダウンロードするため2〜5分かかります。2回目以降はキャッシュで数秒。")
+    # === 基本設定 ===
+    with st.expander("⚙️ 基本設定", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            period = st.selectbox("期間", ["1y", "3y", "5y"], index=2)
+        with c2:
+            freq_display = st.selectbox("リバランス頻度",
+                                         ["両方（比較）", "毎週（W-FRI）", "毎月（末日）"])
+        with c3:
+            top_n = st.number_input("保有銘柄数 (TOP N)", min_value=3, max_value=30, value=10)
+        with c4:
+            initial_capital = st.number_input("初期資金 (円)",
+                                               min_value=10000, value=1_000_000, step=100_000)
+
+    # === 戦略選択 (Step A) ===
+    with st.expander("🎯 戦略選択（A/B比較）", expanded=True):
+        strategy_compare = st.checkbox("3戦略を並列比較", value=True,
+            help="逆張り型 vs モメンタム型 vs 質の高い順張り を一度に比較")
+        if not strategy_compare:
+            strategy_key = st.selectbox(
+                "単一戦略で実行",
+                list(SCORING_STRATEGIES.keys()),
+                format_func=lambda k: SCORING_STRATEGIES[k]["name"],
+            )
+            st.caption(f"📖 {SCORING_STRATEGIES[strategy_key]['desc']}")
+        else:
+            st.caption("📖 3戦略の詳細:")
+            for k, s in SCORING_STRATEGIES.items():
+                st.caption(f"・ **{s['name']}** — {s['desc']}")
+
+    # === ユニバース選択 (Step C) ===
+    with st.expander("🌐 ユニバース（投資対象）", expanded=True):
+        universe_key = st.selectbox(
+            "対象銘柄セット",
+            list(UNIVERSE_OPTIONS.keys()),
+            index=2,  # expanded がデフォルト
+            format_func=lambda k: UNIVERSE_OPTIONS[k]["name"],
+        )
+        st.caption(f"📖 {UNIVERSE_OPTIONS[universe_key]['desc']}")
+
+    # === 売り時ルール (Step B) ===
+    with st.expander("✂️ 売り時ルール（オプション）", expanded=False):
+        st.caption("指定した条件に達したら、次のリバランスを待たずに即売却。すべて None なら純粋な時間ベースリバランス。")
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            enable_tp = st.checkbox("利確 (+X%)", value=False)
+            take_profit = st.number_input("利確%", min_value=5, max_value=100, value=20, disabled=not enable_tp)
+        with sc2:
+            enable_sl = st.checkbox("損切り (-Y%)", value=False)
+            stop_loss = st.number_input("損切り%", min_value=3, max_value=50, value=10, disabled=not enable_sl)
+        with sc3:
+            enable_ts = st.checkbox("トレーリングストップ", value=False)
+            trailing_stop = st.number_input("最高値から -Z%", min_value=3, max_value=30, value=8, disabled=not enable_ts)
+
+        tp_val = take_profit if enable_tp else None
+        sl_val = stop_loss if enable_sl else None
+        ts_val = trailing_stop if enable_ts else None
+
+    st.caption("💡 初回実行は2〜5分。2回目以降はキャッシュ（1日）で数秒。設定変更でキャッシュが更新されます。")
 
     if not st.button("▶ バックテストを実行", type="primary"):
         st.info("上のボタンを押すと計算が始まります。")
         return
 
-    # ティッカー署名（univ変更検知用、現状は latest_analysis のhash）
-    from backtester import get_default_tickers
-    tickers = get_default_tickers()
-    ticker_sig = hashlib.md5(",".join(sorted(tickers)).encode()).hexdigest()[:8] if tickers else ""
-
+    # ティッカー署名
+    tickers = UNIVERSE_OPTIONS[universe_key]["fn"]()
     if not tickers:
-        st.error("data/latest_analysis.csv が見つかりません。先に `python run.py` を実行してください。")
+        st.error("ユニバースが空です。")
         return
+    ticker_sig = hashlib.md5(",".join(sorted(tickers)).encode()).hexdigest()[:8]
 
     freqs = []
     if freq_display == "両方（比較）":
@@ -1002,116 +1054,119 @@ def page_backtest():
     else:
         freqs = [("monthly", "毎月")]
 
-    results = {}
-    for freq_code, freq_label in freqs:
-        with st.spinner(f"{freq_label}リバランスで計算中...（初回は数分かかります）"):
+    # 戦略リスト
+    if strategy_compare:
+        strategies = list(SCORING_STRATEGIES.keys())
+    else:
+        strategies = [strategy_key]
+
+    # 実行: (戦略 × 頻度) 全組み合わせ
+    results = {}  # (strategy, freq_label) -> (result, bench)
+    total_runs = len(strategies) * len(freqs)
+    run_idx = 0
+    progress = st.progress(0.0)
+    for strat_key in strategies:
+        strat_short = SCORING_STRATEGIES[strat_key]["short"]
+        for freq_code, freq_label in freqs:
+            run_idx += 1
+            progress.progress(run_idx / total_runs,
+                              text=f"({run_idx}/{total_runs}) {strat_short} × {freq_label}...")
             try:
-                result, bench = _cached_backtest(period, freq_code, top_n, initial_capital, ticker_sig)
-                results[freq_label] = (result, bench)
+                result, bench = _cached_backtest(
+                    period, freq_code, top_n, initial_capital,
+                    universe_key, strat_key, ticker_sig,
+                    tp_val, sl_val, ts_val,
+                )
+                results[(strat_key, freq_label)] = (result, bench)
             except Exception as e:
-                st.error(f"{freq_label}: {e}")
-                return
+                st.error(f"{strat_short} × {freq_label}: {e}")
+    progress.empty()
 
     if not results:
         st.error("計算に失敗しました。")
         return
 
-    # === サマリーKPI ===
-    st.markdown("## 📊 パフォーマンスサマリー")
-    n_freq = len(results)
-    cols = st.columns(n_freq)
-    for col, (freq_label, (result, bench)) in zip(cols, results.items()):
+    # === サマリー: 全戦略×頻度の比較ランキング ===
+    st.markdown("## 🏆 戦略パフォーマンス・ランキング")
+
+    # 集約テーブル
+    summary_rows = []
+    for (strat_key, freq_label), (result, _) in results.items():
         m = result["metrics"]
-        ret_color = "#27ae60" if m["annual_return_pct"] >= 0 else "#e74c3c"
-        dd_color = "#e74c3c" if m["max_drawdown_pct"] < -20 else "#f39c12"
-        col.markdown(f"""
-<div style="border:1px solid rgba(255,255,255,0.2);border-radius:8px;padding:14px">
-<div style="font-size:14px;color:#aaa">▶ {freq_label}リバランス</div>
-<div style="font-size:12px;color:#888;margin-top:4px">期間: {m['period_years']}年 / {m['n_rebalances']}回</div>
+        strat_short = SCORING_STRATEGIES[strat_key]["short"]
+        summary_rows.append({
+            "戦略": strat_short,
+            "リバランス": freq_label,
+            "累積リターン": m["total_return_pct"],
+            "年率リターン": m["annual_return_pct"],
+            "Sharpe": m["sharpe_ratio"],
+            "最大DD": m["max_drawdown_pct"],
+            "勝率": m["win_rate_pct"],
+            "年ボラ": m["annual_volatility_pct"],
+            "最終資産": m["final"],
+        })
+    sum_df = pd.DataFrame(summary_rows).sort_values("年率リターン", ascending=False).reset_index(drop=True)
+    sum_df.index = sum_df.index + 1  # 1-start rank
+    sum_df["年率リターン"] = sum_df["年率リターン"].map(lambda x: f"{x:+.2f}%")
+    sum_df["累積リターン"] = sum_df["累積リターン"].map(lambda x: f"{x:+.2f}%")
+    sum_df["最大DD"] = sum_df["最大DD"].map(lambda x: f"{x:.1f}%")
+    sum_df["勝率"] = sum_df["勝率"].map(lambda x: f"{x:.1f}%")
+    sum_df["年ボラ"] = sum_df["年ボラ"].map(lambda x: f"{x:.1f}%")
+    sum_df["最終資産"] = sum_df["最終資産"].map(lambda x: f"¥{x:,.0f}")
+    st.dataframe(sum_df, use_container_width=True)
 
-<div style="margin-top:12px">
-  <div style="font-size:11px;color:#aaa">年率リターン</div>
-  <div style="font-size:24px;font-weight:bold;color:{ret_color}">{m['annual_return_pct']:+.2f}%</div>
-</div>
-
-<div style="margin-top:8px">
-  <div style="font-size:11px;color:#aaa">累積リターン</div>
-  <div style="font-size:16px;font-weight:bold;color:{ret_color}">{m['total_return_pct']:+.2f}%</div>
-  <div style="font-size:11px;color:#888">¥{m['initial']:,.0f} → ¥{m['final']:,.0f}</div>
-</div>
-
-<div style="display:flex;gap:16px;margin-top:10px">
-  <div>
-    <div style="font-size:11px;color:#aaa">Sharpe</div>
-    <div style="font-size:16px;font-weight:bold">{m['sharpe_ratio']}</div>
-  </div>
-  <div>
-    <div style="font-size:11px;color:#aaa">最大DD</div>
-    <div style="font-size:16px;font-weight:bold;color:{dd_color}">{m['max_drawdown_pct']:.1f}%</div>
-  </div>
-  <div>
-    <div style="font-size:11px;color:#aaa">勝率</div>
-    <div style="font-size:16px;font-weight:bold">{m['win_rate_pct']}%</div>
-  </div>
-  <div>
-    <div style="font-size:11px;color:#aaa">年ボラ</div>
-    <div style="font-size:16px;font-weight:bold">{m['annual_volatility_pct']}%</div>
-  </div>
-</div>
-</div>
-""", unsafe_allow_html=True)
+    st.caption("💡 年率リターン順。ベンチマーク（SPY / 日経225）は下のチャートで比較。")
 
     # === 資産推移チャート ===
     st.markdown("## 📈 資産推移（vs ベンチマーク）")
     import plotly.graph_objects as go
     fig = go.Figure()
 
-    colors = ["#27ae60", "#3498db"]
-    for i, (freq_label, (result, bench)) in enumerate(results.items()):
+    palette = ["#27ae60", "#e74c3c", "#3498db", "#9b59b6", "#f39c12", "#16a085"]
+    for i, ((strat_key, freq_label), (result, bench)) in enumerate(results.items()):
         eq = result["equity_curve"]
+        strat_short = SCORING_STRATEGIES[strat_key]["short"]
         fig.add_trace(go.Scatter(
             x=eq["date"], y=eq["equity"],
-            name=f"TOP{top_n} {freq_label}",
-            line=dict(color=colors[i % len(colors)], width=2.5),
+            name=f"{strat_short} ({freq_label})",
+            line=dict(color=palette[i % len(palette)], width=2.2),
         ))
 
     # ベンチマーク（どれか1つから取得）
     first_bench = list(results.values())[0][1]
-    bench_colors = ["#95a5a6", "#e74c3c"]
+    bench_colors = ["#95a5a6", "#c0392b"]
     for i, (lbl, bdf) in enumerate(first_bench.items()):
         if bdf.empty:
             continue
         fig.add_trace(go.Scatter(
             x=bdf["date"], y=bdf["equity"],
             name=lbl,
-            line=dict(color=bench_colors[i % len(bench_colors)], width=1.5, dash="dash"),
+            line=dict(color=bench_colors[i % len(bench_colors)], width=1.8, dash="dash"),
         ))
 
     fig.update_layout(
         yaxis_title="資産評価額（円）",
         xaxis_title="日付",
-        height=500,
+        height=540,
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # === ベンチマーク比較テーブル ===
+    # === ベンチマーク比較（含むベンチマーク） ===
     st.markdown("### 📊 ベンチマーク比較")
     comp_rows = []
-    # 戦略
-    for freq_label, (result, _) in results.items():
+    for (strat_key, freq_label), (result, _) in results.items():
         m = result["metrics"]
+        strat_short = SCORING_STRATEGIES[strat_key]["short"]
         comp_rows.append({
-            "戦略/ベンチ": f"TOP{top_n} {freq_label}",
+            "戦略/ベンチ": f"{strat_short} × {freq_label}",
             "累積リターン": f"{m['total_return_pct']:+.2f}%",
             "年率リターン": f"{m['annual_return_pct']:+.2f}%",
             "年率ボラ": f"{m['annual_volatility_pct']:.2f}%",
             "Sharpe": m["sharpe_ratio"],
             "最大DD": f"{m['max_drawdown_pct']:.2f}%",
         })
-    # ベンチマーク
-    initial = initial_capital
     for lbl, bdf in first_bench.items():
         if bdf.empty:
             continue
@@ -1127,7 +1182,7 @@ def page_backtest():
         dd = ((bdf["equity"]-cummax)/cummax*100).min()
         sharpe = (annual_r-2)/daily_vol if daily_vol > 0 else 0
         comp_rows.append({
-            "戦略/ベンチ": lbl,
+            "戦略/ベンチ": f"★ {lbl}",
             "累積リターン": f"{total_r:+.2f}%",
             "年率リターン": f"{annual_r:+.2f}%",
             "年率ボラ": f"{daily_vol:.2f}%",
@@ -1136,26 +1191,41 @@ def page_backtest():
         })
     st.dataframe(pd.DataFrame(comp_rows), hide_index=True, use_container_width=True)
 
-    # === 取引履歴ダイジェスト ===
+    # === 取引履歴（売却理由付き） ===
     st.markdown("## 📋 取引履歴ダイジェスト")
-    for freq_label, (result, _) in results.items():
+    for (strat_key, freq_label), (result, _) in results.items():
         trades = result["trades"]
+        strat_short = SCORING_STRATEGIES[strat_key]["short"]
         if trades.empty:
             continue
-        with st.expander(f"▶ {freq_label}リバランス - {len(trades)}件の取引"):
-            # 直近の取引20件
-            st.markdown("**直近の取引（新しい順）**")
-            recent = trades.sort_values("date", ascending=False).head(20).copy()
-            recent["date"] = pd.to_datetime(recent["date"]).dt.strftime("%Y-%m-%d")
-            display_cols = [c for c in ["date", "ticker", "action", "shares", "price", "value", "score"] if c in recent.columns]
-            st.dataframe(recent[display_cols], hide_index=True, use_container_width=True)
+        with st.expander(f"▶ {strat_short} × {freq_label} — {len(trades)}件"):
+            # 売却理由の内訳
+            if "reason" in trades.columns:
+                sell_df = trades[trades["action"]=="sell"]
+                if not sell_df.empty and sell_df["reason"].notna().any():
+                    st.markdown("**売却理由の内訳**")
+                    reason_counts = sell_df["reason"].value_counts().reset_index()
+                    reason_counts.columns = ["売却理由", "件数"]
+                    # 平均リターンも計算
+                    if "return_pct" in sell_df.columns:
+                        reason_ret = sell_df.groupby("reason")["return_pct"].mean().round(2).reset_index()
+                        reason_ret.columns = ["売却理由", "平均リターン(%)"]
+                        reason_counts = reason_counts.merge(reason_ret, on="売却理由", how="left")
+                    st.dataframe(reason_counts, hide_index=True, use_container_width=True)
 
-            # 頻出銘柄 TOP10
+            # 頻出銘柄
             buys = trades[trades["action"] == "buy"]
             if not buys.empty:
                 st.markdown("**頻繁に選ばれた銘柄 TOP10**")
                 counts = buys.groupby("ticker").size().reset_index(name="選出回数").sort_values("選出回数", ascending=False).head(10)
                 st.dataframe(counts, hide_index=True, use_container_width=True)
+
+            # 直近取引
+            st.markdown("**直近の取引 20件**")
+            recent = trades.sort_values("date", ascending=False).head(20).copy()
+            recent["date"] = pd.to_datetime(recent["date"]).dt.strftime("%Y-%m-%d")
+            display_cols = [c for c in ["date","ticker","action","reason","shares","price","value","score","return_pct"] if c in recent.columns]
+            st.dataframe(recent[display_cols], hide_index=True, use_container_width=True)
 
     # === 免責 ===
     st.markdown("---")

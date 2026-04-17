@@ -55,6 +55,59 @@ def get_default_tickers():
     return tickers
 
 
+# =====================================
+# ユニバース定義（Step C）
+# =====================================
+
+# 大型安定株（S&P500/日経225の中核銘柄）
+LARGE_CAP_US = [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA",
+    "BRK-B", "TSM", "V", "JPM", "UNH", "JNJ",
+    "WMT", "XOM", "MA", "PG", "HD", "CVX",
+    "ABBV", "KO", "PEP", "AVGO", "LLY", "COST",
+    "MCD", "TMO", "ABT", "CSCO",
+]
+
+LARGE_CAP_JP = [
+    "7203", "6758", "8306", "9432", "6098",  # トヨタ、ソニー、MUFG、NTT、リクルート
+    "9984", "8316", "8058", "4063", "7974",  # SBG、SMFG、三菱商事、信越化、任天堂
+    "8001", "6861", "6367", "4452", "4502",  # 伊藤忠、キーエンス、ダイキン、花王、武田
+    "8031", "6594", "7267", "9433", "4063",  # 三井物産、ニデック、ホンダ、KDDI
+]
+
+
+def get_large_cap_universe():
+    """大型株のみのユニバース"""
+    return LARGE_CAP_US + list(dict.fromkeys(LARGE_CAP_JP))  # 重複除去
+
+
+def get_expanded_universe():
+    """現ユニバース + 大型安定株（重複除去）"""
+    base = get_default_tickers()
+    large = LARGE_CAP_US + list(dict.fromkeys(LARGE_CAP_JP))
+    merged = list(dict.fromkeys(base + large))  # 順序保持で重複除去
+    return merged
+
+
+UNIVERSE_OPTIONS = {
+    "current": {
+        "name": "現ユニバース（118銘柄、成長株中心）",
+        "desc": "latest_analysis.csv のSaaS/AI/バイオ中心の銘柄群。セクター偏り有り",
+        "fn": get_default_tickers,
+    },
+    "large_cap": {
+        "name": "大型安定株のみ（約45銘柄）",
+        "desc": "S&P500中核+日経225中核。ディフェンシブで市場連動性が高い",
+        "fn": get_large_cap_universe,
+    },
+    "expanded": {
+        "name": "拡張ユニバース（現+大型株、約160銘柄）",
+        "desc": "成長株に大型安定株を追加。分散効果で安定感UP",
+        "fn": get_expanded_universe,
+    },
+}
+
+
 def to_yf_symbol(ticker):
     """数字のみの日本株は .T を付与"""
     s = str(ticker).strip()
@@ -218,51 +271,152 @@ def compute_indicators_at(ohlcv, asof_date, min_history=252):
     return pd.DataFrame(results)
 
 
-def compute_tech_score(row):
-    """テクニカルのみの 0-100 スコア
+def compute_score_mean_reversion(row):
+    """逆張り型（現状）: 売られすぎ銘柄を拾う
 
-    - RSI: 売られすぎで加点
-    - 52週位置: 底値圏で加点
-    - MACD: 上昇中で加点
-    - MA alignment: 長期上昇トレンドで加点
-    - 出来高: 急増で加点
-    - モメンタム: 直近5日上昇で加点
+    - RSI低・52週位置低で大きく加点
+    - 下落からのリバウンド期待型
     """
     score = 50.0
-
-    # RSI
     rsi = row["rsi_14"]
     if rsi <= 30: score += 15
     elif rsi <= 40: score += 10
     elif rsi <= 50: score += 5
     elif rsi >= 70: score -= 10
     elif rsi >= 60: score -= 5
-
-    # 52週位置
     pos = row["pos_52w_pct"]
     if pos <= 15: score += 15
     elif pos <= 30: score += 10
     elif pos <= 50: score += 5
     elif pos >= 90: score -= 10
-
-    # MACD
     if row["macd_histogram"] > 0: score += 10
     else: score -= 5
-
-    # MA整合性
     p = row["price"]
     sma20, sma50, sma200 = row["sma_20"], row["sma_50"], row["sma_200"]
     if p > sma20 and sma20 > sma50: score += 5
     if p > sma200: score += 5
-    if sma50 > sma200: score += 3  # 長期上昇
-
-    # 出来高
+    if sma50 > sma200: score += 3
     if row["vol_ratio"] >= 1.5: score += 3
-
-    # 5日モメンタム
     if row["mom_5d_pct"] > 0: score += 2
+    return max(0.0, min(100.0, score))
+
+
+def compute_score_momentum(row):
+    """モメンタム型: 強いトレンドに乗る
+
+    - RSI 50-70 (sweet spot) と 52週高値近辺で加点
+    - MACD陽線・価格>SMA・上昇配列 で加点
+    """
+    score = 50.0
+    rsi = row["rsi_14"]
+    # RSI sweet spot (50-70)
+    if 50 <= rsi <= 70: score += 15
+    elif 40 <= rsi < 50: score += 5
+    elif rsi > 80: score -= 15  # 過熱はペナルティ
+    elif rsi < 30: score -= 10  # 下落トレンドは回避
+
+    # 52週位置: 高値近辺がベスト
+    pos = row["pos_52w_pct"]
+    if pos >= 80: score += 15
+    elif pos >= 60: score += 10
+    elif pos >= 40: score += 3
+    elif pos <= 20: score -= 10  # 底値は買わない
+
+    # MACD: 強い上昇モメンタム
+    macd_hist = row["macd_histogram"]
+    if macd_hist > 0: score += 15
+    else: score -= 10
+
+    # MA 配列: 完全な上昇配列 (Price > SMA20 > SMA50 > SMA200) が理想
+    p = row["price"]
+    sma20, sma50, sma200 = row["sma_20"], row["sma_50"], row["sma_200"]
+    if p > sma20 > sma50 > sma200: score += 12  # Golden alignment
+    elif p > sma50 > sma200: score += 8
+    elif p > sma200: score += 3
+    else: score -= 5  # 長期下降トレンド
+
+    # 出来高: モメンタムを伴う急増
+    vol = row["vol_ratio"]
+    if vol >= 2.0: score += 5
+    elif vol >= 1.3: score += 3
+
+    # 5日モメンタム: 直近上昇
+    mom = row["mom_5d_pct"]
+    if mom > 2: score += 5
+    elif mom > 0: score += 2
+    elif mom < -3: score -= 5
 
     return max(0.0, min(100.0, score))
+
+
+def compute_score_quality_momentum(row):
+    """質の高い順張り: モメンタム＋長期トレンド裏付け
+
+    - モメンタムの中でも「長期上昇が続いているもの」に絞る
+    - 52週高値更新を軸に、RSIは過熱しすぎず、出来高も裏付けあり
+    """
+    score = 50.0
+    rsi = row["rsi_14"]
+    # 過熱していないモメンタム: 50-65
+    if 50 <= rsi <= 65: score += 18
+    elif 45 <= rsi < 50: score += 8
+    elif rsi > 75: score -= 20  # 明確な過熱はむしろ危険
+    elif rsi < 40: score -= 10
+
+    # 52週位置: 最高値付近 (長期上昇のシグナル)
+    pos = row["pos_52w_pct"]
+    if pos >= 85: score += 18
+    elif pos >= 70: score += 12
+    elif pos >= 50: score += 3
+    elif pos <= 30: score -= 15
+
+    # MACD
+    if row["macd_histogram"] > 0: score += 10
+    else: score -= 8
+
+    # MA alignment (厳格版): 完全な上昇配列必須
+    p = row["price"]
+    sma20, sma50, sma200 = row["sma_20"], row["sma_50"], row["sma_200"]
+    if p > sma20 > sma50 > sma200: score += 15
+    elif sma50 > sma200 and p > sma50: score += 5
+    else: score -= 10  # 長期下降はペナルティ大
+
+    # 出来高の裏付け (モメンタム+出来高は強いシグナル)
+    if row["vol_ratio"] >= 1.3: score += 5
+
+    # 直近モメンタム (軽め)
+    mom = row["mom_5d_pct"]
+    if mom > 0: score += 3
+    elif mom < -5: score -= 5
+
+    return max(0.0, min(100.0, score))
+
+
+# 旧名の後方互換 alias
+compute_tech_score = compute_score_mean_reversion
+
+
+# 戦略カタログ
+SCORING_STRATEGIES = {
+    "mean_reversion": {
+        "name": "逆張り型（売られすぎ買い）",
+        "short": "逆張り",
+        "desc": "RSI低・52週位置低・MACD反転で加点。下落からのリバウンド狙い。現状の買い推奨TOP10と同じロジック",
+        "fn": compute_score_mean_reversion,
+    },
+    "momentum": {
+        "name": "モメンタム型（順張り）",
+        "short": "モメンタム",
+        "desc": "RSI 50-70・52週位置高・上昇配列で加点。強いトレンドに乗る",
+        "fn": compute_score_momentum,
+    },
+    "quality_momentum": {
+        "name": "質の高い順張り",
+        "short": "質モメンタム",
+        "desc": "モメンタム＋長期上昇配列＋過熱回避＋出来高裏付け。より厳しい条件で絞る",
+        "fn": compute_score_quality_momentum,
+    },
+}
 
 
 # ==========================================
@@ -288,7 +442,11 @@ def run_backtest(
     top_n=10,
     initial_capital=1_000_000,
     ohlcv=None,
-    cost_bps=10,  # 往復10bp (0.10%) の取引コスト
+    cost_bps=10,
+    strategy="mean_reversion",
+    take_profit_pct=None,   # +X% で利確（None なら発動なし）
+    stop_loss_pct=None,     # -Y% で損切り
+    trailing_stop_pct=None, # 最高値から -Z% で利確
 ):
     """メインのバックテスト関数
 
@@ -300,6 +458,10 @@ def run_backtest(
         initial_capital: 初期資金（円）
         ohlcv: 既に取得済みの OHLCV DataFrame（渡せば再取得しない）
         cost_bps: 1往復あたりの取引コスト (bp = 1/10000)
+        strategy: SCORING_STRATEGIES キー（"mean_reversion"/"momentum"/"quality_momentum"）
+        take_profit_pct: +X% で早期利確（例: 20 → +20%で売却）
+        stop_loss_pct: -Y% で損切り（例: 10 → -10%で売却）
+        trailing_stop_pct: 最高値から -Z% 下落で売却（例: 5 → トレーリングストップ5%）
 
     Returns:
         dict: equity_curve, trades, metrics, rebalance_dates, config
@@ -309,59 +471,112 @@ def run_backtest(
     if ohlcv is None:
         ohlcv = fetch_historical_ohlcv(tickers, period=period)
 
+    # 戦略確定
+    if strategy not in SCORING_STRATEGIES:
+        raise ValueError(f"Unknown strategy: {strategy}. Available: {list(SCORING_STRATEGIES.keys())}")
+    score_fn = SCORING_STRATEGIES[strategy]["fn"]
+
     dates_list = _rebalance_dates(ohlcv["date"].min(), ohlcv["date"].max(), rebalance_freq)
     if not dates_list:
         raise RuntimeError(f"リバランス日が0件。期間={period}")
 
+    # 高速アクセス用: (ticker, date) → Close の辞書
+    price_lookup = {
+        (r.ticker, r.date): r.Close for r in ohlcv[["ticker", "date", "Close"]].itertuples(index=False)
+    }
+    # ticker → 時系列DataFrame
+    ticker_series = {tk: sub.sort_values("date").reset_index(drop=True)
+                     for tk, sub in ohlcv.groupby("ticker", sort=False)}
+
+    cost_factor = 1 - cost_bps / 10000
+
     cash = float(initial_capital)
-    holdings = {}  # ticker -> shares
+    holdings = {}  # ticker -> dict(shares, entry_price, entry_date, high_since_entry)
     equity_curve = []
     trade_log = []
 
-    for rb_date in dates_list:
+    def _sell(tk, sell_date, sell_price, reason):
+        """売却処理"""
+        nonlocal cash
+        h = holdings[tk]
+        shares = h["shares"]
+        proceeds = shares * sell_price * cost_factor
+        cash += proceeds
+        trade_log.append({
+            "date": sell_date, "ticker": tk, "action": "sell",
+            "shares": shares, "price": sell_price, "value": proceeds,
+            "reason": reason,
+            "entry_price": h["entry_price"],
+            "holding_days": (pd.Timestamp(sell_date) - pd.Timestamp(h["entry_date"])).days,
+            "return_pct": (sell_price / h["entry_price"] - 1) * 100,
+        })
+        del holdings[tk]
+
+    for rb_idx, rb_date in enumerate(dates_list):
         # リバランス日の最寄り取引日
         valid = ohlcv[ohlcv["date"] <= rb_date]
         if valid.empty:
             continue
         asof = valid["date"].max()
 
-        # 現在価値を確定（売却直前）
+        # --- STEP 1: リバランス間の日次チェック (売り時ルールがある場合のみ) ---
+        if take_profit_pct is not None or stop_loss_pct is not None or trailing_stop_pct is not None:
+            # 前回 asof 〜 今回 asof の間の日次で exit 条件をチェック
+            prev_asof = equity_curve[-1]["date"] if equity_curve else ohlcv["date"].min()
+            trading_days = sorted({d for d in ohlcv["date"].unique() if prev_asof < d < asof})
+            for d in trading_days:
+                for tk in list(holdings.keys()):
+                    px = price_lookup.get((tk, d))
+                    if px is None:
+                        continue
+                    h = holdings[tk]
+                    h["high_since_entry"] = max(h["high_since_entry"], px)
+                    ret = (px / h["entry_price"] - 1) * 100
+                    trailing_ret = (px / h["high_since_entry"] - 1) * 100
+                    if take_profit_pct is not None and ret >= take_profit_pct:
+                        _sell(tk, d, px, "take_profit")
+                    elif stop_loss_pct is not None and ret <= -stop_loss_pct:
+                        _sell(tk, d, px, "stop_loss")
+                    elif trailing_stop_pct is not None and trailing_ret <= -trailing_stop_pct:
+                        _sell(tk, d, px, "trailing_stop")
+
+        # --- STEP 2: 現在価値を確定（売却直前の time-based リバランス） ---
         portfolio_value = cash
-        for tk, shares in holdings.items():
-            pr = ohlcv[(ohlcv["ticker"] == tk) & (ohlcv["date"] == asof)]
-            if not pr.empty:
-                portfolio_value += shares * pr.iloc[0]["Close"]
+        for tk, h in holdings.items():
+            px = price_lookup.get((tk, asof))
+            if px is not None:
+                portfolio_value += h["shares"] * px
         equity_curve.append({"date": asof, "equity": portfolio_value})
 
-        # 既存保有を売却
-        cost_factor = 1 - cost_bps / 10000
-        for tk, shares in list(holdings.items()):
-            pr = ohlcv[(ohlcv["ticker"] == tk) & (ohlcv["date"] == asof)]
-            if not pr.empty:
-                sell_price = float(pr.iloc[0]["Close"])
-                proceeds = shares * sell_price * cost_factor
-                cash += proceeds
-                trade_log.append({
-                    "date": asof, "ticker": tk, "action": "sell",
-                    "shares": shares, "price": sell_price, "value": proceeds,
-                })
-        holdings = {}
+        # --- STEP 3: 既存保有を全売却 (time-based) ---
+        for tk in list(holdings.keys()):
+            px = price_lookup.get((tk, asof))
+            if px is not None:
+                _sell(tk, asof, float(px), "rebalance")
+            else:
+                # データが無い場合: 抹消（事実上0円処理）
+                del holdings[tk]
 
-        # テクニカル計算 & TOP_N 選定
+        # --- STEP 4: テクニカル計算 & TOP_N 選定 ---
         inds = compute_indicators_at(ohlcv, asof)
         if inds.empty:
             continue
-        inds["score"] = inds.apply(compute_tech_score, axis=1)
+        inds["score"] = inds.apply(score_fn, axis=1)
         top = inds.nlargest(top_n, "score")
 
         if len(top) > 0:
-            per_cash = cash / len(top) * cost_factor  # 手数料引き
+            per_cash = cash / len(top) * cost_factor
             for _, r in top.iterrows():
                 shares = int(per_cash / r["price"])
                 if shares > 0:
                     cost = shares * r["price"]
-                    holdings[r["ticker"]] = shares
-                    cash -= cost / cost_factor  # 実際の現金出動額
+                    cash -= cost / cost_factor
+                    holdings[r["ticker"]] = {
+                        "shares": shares,
+                        "entry_price": float(r["price"]),
+                        "entry_date": asof,
+                        "high_since_entry": float(r["price"]),
+                    }
                     trade_log.append({
                         "date": asof, "ticker": r["ticker"], "action": "buy",
                         "shares": shares, "price": float(r["price"]), "value": cost,
@@ -371,10 +586,10 @@ def run_backtest(
     # 最終日時点の評価
     last_date = ohlcv["date"].max()
     final_equity = cash
-    for tk, shares in holdings.items():
-        pr = ohlcv[(ohlcv["ticker"] == tk) & (ohlcv["date"] == last_date)]
-        if not pr.empty:
-            final_equity += shares * pr.iloc[0]["Close"]
+    for tk, h in holdings.items():
+        px = price_lookup.get((tk, last_date))
+        if px is not None:
+            final_equity += h["shares"] * px
     equity_curve.append({"date": last_date, "equity": final_equity})
 
     eq_df = pd.DataFrame(equity_curve).drop_duplicates(subset="date", keep="last")
@@ -386,10 +601,15 @@ def run_backtest(
         "trades": trade_df,
         "metrics": metrics,
         "rebalance_dates": dates_list,
+        "strategy": strategy,
         "config": {
             "period": period, "rebalance_freq": rebalance_freq,
             "top_n": top_n, "initial_capital": initial_capital,
             "cost_bps": cost_bps, "n_tickers": len(tickers),
+            "strategy": strategy,
+            "take_profit_pct": take_profit_pct,
+            "stop_loss_pct": stop_loss_pct,
+            "trailing_stop_pct": trailing_stop_pct,
         },
     }
 
