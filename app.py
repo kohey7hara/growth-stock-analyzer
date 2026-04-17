@@ -92,7 +92,7 @@ st.set_page_config(page_title="Growth Stock Analyzer", layout="wide")
 st.sidebar.title("Growth Stock Analyzer")
 page = st.sidebar.radio(
     "ページ選択",
-    ["ダッシュボード", "銘柄詳細", "ポートフォリオ", "スクリーニング", "予測シミュレーション", "予測精度検証"],
+    ["ダッシュボード", "買い推奨TOP10", "予測精度検証"],
 )
 
 
@@ -342,276 +342,271 @@ def page_dashboard():
 
 
 # ──────────────────────────────────────────────
-# ページ2: 銘柄詳細
+# ページ2: 買い推奨TOP10
 # ──────────────────────────────────────────────
 
-PERIOD_MAP = {
-    "1日":("1d","5m"), "1週":("5d","15m"), "1ヶ月":("1mo","1h"),
-    "6ヶ月":("6mo","1d"), "1年":("1y","1d"), "2年":("2y","1wk"), "5年":("5y","1wk"),
-}
+def _up_probability(expected_pct, l95, u95):
+    """95%信頼区間から正規分布を仮定して上昇確率を算出
 
-def page_detail():
-    st.header("銘柄詳細")
-    analysis_df = load_analysis()
-    if analysis_df is None or analysis_df.empty:
-        st.warning("分析データがありません。先に `python run.py` を実行してください。")
-        return
-
-    options = [f"{r['ticker']} - {r['name']}" for _, r in analysis_df.iterrows()]
-    selected_opt = st.sidebar.selectbox("銘柄を選択", options)
-    selected = selected_opt.split(" - ")[0]
-    row = analysis_df[analysis_df["ticker"]==selected].iloc[0]
-    ri = " ⚠️" if row.get("risk_count",0) > 0 else ""
-    st.subheader(f"{selected}{ri} - {row.get('name','')}")
-
-    indicators = {"RSI(14)":"rsi_14","MACD":"macd","BB位置":"bb_position",
-                  "出来高比率":"vol_ratio","52週位置(%)":"pos_52w_pct","スコア":"total_score","シグナル":"signal"}
-    cols = st.columns(len(indicators))
-    for col, (lab, key) in zip(cols, indicators.items()):
-        val = row.get(key, "N/A")
-        col.metric(lab, f"{val:.2f}" if isinstance(val, float) else str(val))
-
-    period_label = st.radio("チャート期間", list(PERIOD_MAP.keys()), index=4, horizontal=True)
-    yf_period, yf_interval = PERIOD_MAP[period_label]
-
-    ohlc = load_ohlc_dynamic(selected, period=yf_period, interval=yf_interval)
-    if not ohlc.empty:
-        ohlc_s = ohlc.sort_index()
-        sma_w = [20,50,200] if yf_interval in ["1d","1wk"] else ([20,50] if yf_interval=="1h" else [20])
-        for w in sma_w:
-            if len(ohlc_s) >= w:
-                ohlc_s[f"SMA{w}"] = ohlc_s["Close"].rolling(w).mean()
-
-        rsi_s = compute_rsi(ohlc_s["Close"])
-        macd_l, sig_l, hist_l = compute_macd(ohlc_s["Close"])
-
-        fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
-                            row_heights=[0.5,0.15,0.15,0.2], vertical_spacing=0.03,
-                            subplot_titles=[f"{selected} {period_label}チャート","RSI","MACD","出来高"])
-
-        fig.add_trace(go.Candlestick(x=ohlc_s.index, open=ohlc_s["Open"], high=ohlc_s["High"],
-                                      low=ohlc_s["Low"], close=ohlc_s["Close"], name="OHLC"), row=1, col=1)
-        for sma, c in {"SMA20":"orange","SMA50":"blue","SMA200":"red"}.items():
-            if sma in ohlc_s.columns:
-                fig.add_trace(go.Scatter(x=ohlc_s.index, y=ohlc_s[sma], mode="lines", name=sma,
-                                          line=dict(color=c, width=1)), row=1, col=1)
-
-        fig.add_trace(go.Scatter(x=ohlc_s.index, y=rsi_s, mode="lines", name="RSI",
-                                  line=dict(color="purple", width=1)), row=2, col=1)
-        fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
-
-        fig.add_trace(go.Scatter(x=ohlc_s.index, y=macd_l, mode="lines", name="MACD",
-                                  line=dict(color="blue", width=1)), row=3, col=1)
-        fig.add_trace(go.Scatter(x=ohlc_s.index, y=sig_l, mode="lines", name="Signal",
-                                  line=dict(color="orange", width=1)), row=3, col=1)
-        fig.add_trace(go.Bar(x=ohlc_s.index, y=hist_l, name="Histogram",
-                              marker_color=["green" if v>=0 else "red" for v in hist_l.fillna(0)]), row=3, col=1)
-
-        if "Volume" in ohlc_s.columns:
-            va = ohlc_s["Volume"].rolling(20).mean()
-            vc = ["red" if (pd.notna(a) and a>0 and v>a*3) else ("orange" if (pd.notna(a) and a>0 and v>a*2) else "steelblue")
-                  for v, a in zip(ohlc_s["Volume"], va)]
-            fig.add_trace(go.Bar(x=ohlc_s.index, y=ohlc_s["Volume"], name="出来高",
-                                  marker_color=vc, opacity=0.7), row=4, col=1)
-
-        fig.update_xaxes(rangebreaks=[dict(bounds=["sat","mon"])], row=1, col=1)
-        fig.update_layout(xaxis_rangeslider_visible=False, height=900, showlegend=True,
-                          legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-        for i, t in enumerate(["価格","RSI","MACD","出来高"], 1):
-            fig.update_yaxes(title_text=t, row=i, col=1)
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("チャートデータを取得できませんでした。")
-
-    # 出来高分析
-    st.subheader("出来高分析")
-    vr = row.get("vol_ratio")
-    if pd.notna(vr):
-        vr = float(vr)
-        gc, tc = st.columns([1,2])
-        with gc:
-            fg = go.Figure(go.Indicator(mode="gauge+number", value=vr,
-                title={"text":"出来高比率 (20日平均比)"},
-                gauge={"axis":{"range":[0,5]}, "bar":{"color":"royalblue"},
-                       "steps":[{"range":[0,1],"color":"lightgray"},{"range":[1,2],"color":"lightyellow"},
-                                {"range":[2,3],"color":"orange"},{"range":[3,5],"color":"red"}]},
-                number={"suffix":"x"}))
-            fg.update_layout(height=250)
-            st.plotly_chart(fg, use_container_width=True)
-        with tc:
-            if vr >= 3: st.error(f"🔥🔥 {vr:.1f}x - 出来高が異常に多い。材料出尽くしの反落に注意。")
-            elif vr >= 2: st.warning(f"🔥 {vr:.1f}x - 取引が活発化。短期的に大きく動く可能性あり。")
-            elif vr <= 0.5: st.info(f"{vr:.1f}x - 閑散相場。値動きは小さいが流動性リスクに注意。")
-            else: st.success(f"{vr:.1f}x - 通常の取引量。")
-
-    # スコア詳細
-    st.subheader("スコア詳細")
-    cr, ct = st.columns([1,2])
-    with cr:
-        cats = ["テクニカル","ファンダメンタルズ","センチメント","モメンタム"]
-        vals = [row.get("tech_score",0), row.get("fund_score",0), row.get("sent_score",0), row.get("mom_score",0)]
-        fr = go.Figure(data=go.Scatterpolar(r=vals+[vals[0]], theta=cats+[cats[0]], fill="toself",
-                                             line=dict(color="royalblue")))
-        fr.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0,100])),
-                         showlegend=False, height=350, title=f"{selected} スコアレーダー")
-        st.plotly_chart(fr, use_container_width=True)
-    with ct:
-        ed = []
-        for key, cat, lab, fmt_fn, meaning_fn in [
-            ("rsi_14","テクニカル","RSI(14)", lambda v:f"{v:.1f}",
-             lambda v:"売られすぎ→反発の可能性" if v<30 else ("買われすぎ→調整リスク" if v>70 else "中立的な水準")),
-            ("macd","テクニカル","MACD", lambda v:f"{v:.4f}", lambda v:"買いの勢い" if v>0 else "売りの勢い"),
-            ("bb_position","テクニカル","BB位置", lambda v:f"{v:.1f}%",
-             lambda v:"バンド下限→反発期待" if v<20 else ("バンド上限→過熱" if v>80 else "中間付近")),
-            ("pos_52w_pct","ファンダ","52週位置", lambda v:f"{v:.1f}%",
-             lambda v:"安値圏→割安の可能性" if v<30 else ("高値圏" if v>70 else "中間水準")),
-            ("pe_ratio","ファンダ","PER", lambda v:f"{v:.1f}x",
-             lambda v:"割安" if v<20 else ("割高" if v>40 else "適正範囲")),
-            ("vol_ratio","モメンタム","出来高比率", lambda v:f"{v:.2f}x",
-             lambda v:"出来高急増" if v>2 else ("やや増" if v>1.2 else "平常")),
-        ]:
-            val = row.get(key)
-            if pd.notna(val):
-                ed.append({"カテゴリ":cat,"指標":lab,"値":fmt_fn(val),"解説":meaning_fn(val)})
-        if ed: st.table(pd.DataFrame(ed))
-
-    with st.expander("スコア算出理由の詳細"):
-        for lab, cn in {"テクニカル":"tech_reasons","ファンダメンタルズ":"fund_reasons",
-                        "センチメント":"sent_reasons","モメンタム":"mom_reasons"}.items():
-            v = row.get(cn, "")
-            if v: st.markdown(f"**{lab}**: {v}")
-
-    comment = row.get("analysis_comment","")
-    if comment:
-        st.subheader("分析コメント")
-        st.info(comment)
+    - mean = expected_pct
+    - std  = (u95 - l95) / (2 * 1.96)
+    - P(ret > 0) = Φ(mean / std)
+    """
+    try:
+        from math import erf, sqrt
+        if pd.isna(expected_pct) or pd.isna(l95) or pd.isna(u95):
+            return None
+        std = (float(u95) - float(l95)) / (2 * 1.96)
+        if std <= 0:
+            return None
+        z = float(expected_pct) / std
+        return 0.5 * (1 + erf(z / sqrt(2)))
+    except Exception:
+        return None
 
 
-# ──────────────────────────────────────────────
-# ページ3: ポートフォリオ
-# ──────────────────────────────────────────────
-
-def page_portfolio():
-    st.header("ポートフォリオ")
-    pf = DATA_DIR / "portfolio.csv"
-    if not pf.exists():
-        st.warning("ポートフォリオファイルが見つかりません。`data/portfolio.csv` を作成してください。")
-        return
-    with st.spinner("ポートフォリオを分析中..."):
-        from portfolio import run_portfolio_analysis
-        port_df, totals = run_portfolio_analysis()
-    if port_df is None or port_df.empty:
-        st.error("ポートフォリオ分析に失敗しました。")
-        return
-    tc = totals["total_current_jpy"] - totals["total_pnl_jpy"]
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("投資総額 (円)", f"¥{tc:,.0f}")
-    c2.metric("評価総額 (円)", f"¥{totals['total_current_jpy']:,.0f}")
-    c3.metric("損益合計 (円)", f"¥{totals['total_pnl_jpy']:,.0f}")
-    c4.metric("損益率", f"{totals['total_pnl_pct']:+.2f}%")
-    st.caption(f"USD/JPY: {totals['usdjpy_rate']:.2f}")
-    st.subheader("保有一覧")
-    st.dataframe(port_df, width="stretch", hide_index=True)
-    st.subheader("ポートフォリオ構成")
-    st.plotly_chart(px.pie(port_df, values="current_value_jpy", names="ticker", title="評価額構成比"),
-                    use_container_width=True)
+def _historical_hit_rates():
+    """horizon別の過去的中率を返す（サイドバーに表示する指標）"""
+    try:
+        acc_path = DATA_DIR / "prediction_accuracy.csv"
+        if not acc_path.exists():
+            return {}
+        acc = pd.read_csv(acc_path)
+        rates = {}
+        # horizon_days 列で正規化
+        if "horizon_days" in acc.columns:
+            for d in [1, 7, 30]:
+                sub = acc[acc["horizon_days"] == d]
+                if len(sub):
+                    rates[d] = sub["direction_correct"].mean() * 100
+        return rates
+    except Exception:
+        return {}
 
 
-# ──────────────────────────────────────────────
-# ページ4: スクリーニング
-# ──────────────────────────────────────────────
+def _signal_action(signal, score, hybrid):
+    """シグナル文字列からアクション推奨文言を生成"""
+    s = str(signal or "")
+    if "強い買い" in s or hybrid >= 70:
+        return ("🟢 本格エントリー", "rgba(46,204,113,0.18)")
+    if "★★" in s and "買い" in s:
+        return ("🟢 分割で打診買い", "rgba(46,204,113,0.12)")
+    if "要注目" in s:
+        return ("🟡 打診買い（少額）", "rgba(241,196,15,0.14)")
+    return ("⚪ 様子見／指値待ち", "rgba(150,150,150,0.10)")
 
-def page_screening():
-    st.header("スクリーニング")
+
+def page_recommend():
+    st.header("💎 今買うべき銘柄 TOP10")
+    st.caption("スコア × 予測ハイブリッドで並び替えた、中期で最も買い妙味のある10銘柄。1日/1週/1ヶ月後の期待変化率・上昇確率・80%信頼区間つき。")
+
     df = load_analysis()
+    pred_df = load_predictions()
+
     if df is None or df.empty:
-        st.warning("分析データがありません。先に `python run.py` を実行してください。")
+        st.warning("分析データがありません。まず `python run.py` を実行してください。")
         return
-    st.sidebar.subheader("フィルタ条件")
-    f = {}
-    if "rsi_14" in df.columns: f["rsi"] = st.sidebar.checkbox("RSI < 30", False)
-    if "vol_ratio" in df.columns: f["vol"] = st.sidebar.checkbox("出来高比率 >= 2.0", False)
-    if "pos_52w_pct" in df.columns: f["pos"] = st.sidebar.checkbox("52週位置 <= 30%", False)
-    ms = st.sidebar.slider("最小スコア", 0.0, 100.0, 0.0, 5.0)
-    filt = df[df["total_score"] >= ms].copy()
-    if f.get("rsi"): filt = filt[filt["rsi_14"] < 30]
-    if f.get("vol"): filt = filt[filt["vol_ratio"] >= 2.0]
-    if f.get("pos"): filt = filt[filt["pos_52w_pct"] <= 30]
-    st.markdown(f"**該当: {len(filt)}件**")
-    dc = ["ticker","name","signal","total_score","price","rsi_14","vol_ratio","pos_52w_pct","analysis_comment"]
-    av = [c for c in dc if c in filt.columns]
-    st.dataframe(filt[av].sort_values("total_score", ascending=False), width="stretch", hide_index=True)
-
-
-# ──────────────────────────────────────────────
-# ページ5: 予測シミュレーション
-# ──────────────────────────────────────────────
-
-def page_prediction():
-    st.header("予測シミュレーション")
-    df = load_analysis()
-    if df is None or df.empty:
-        st.warning("分析データがありません。")
+    if pred_df is None or pred_df.empty:
+        st.warning("予測データ (latest_predictions.csv) がありません。`python run.py` を実行してください。")
         return
-    options = [f"{r['ticker']} - {r['name']}" for _, r in df.iterrows()]
-    selected_opt = st.selectbox("銘柄を選択", options)
-    selected = selected_opt.split(" - ")[0]
-    investment = st.number_input("投資金額 (円)", min_value=10000, value=1000000, step=100000)
-    st.caption(f"投資金額: ¥{investment:,.0f}")
 
-    if st.button("予測を実行"):
-        with st.spinner(f"{selected} の予測を計算中..."):
-            from predictor import predict_stock
-            result = predict_stock(selected)
-        if result is None:
-            st.error("予測データを取得できませんでした。")
-            return
-        st.success(f"予測エンジン: {result['engine']}")
-        cur = result["current_price"]
+    # データ最新時刻
+    try:
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        _latest = pd.to_datetime(df["analysis_time"]).max()
+        _jst = _tz(_td(hours=9))
+        _updated = _latest.tz_localize("UTC").astimezone(_jst).strftime("%Y/%m/%d %H:%M:%S")
+        st.caption(f"🕐 データ最終更新: {_updated} (JST)")
+    except Exception:
+        pass
 
-        plabels = {1:"1日後",7:"1週間後",30:"1ヶ月後",90:"3ヶ月後",180:"6ヶ月後"}
-        st.subheader("予測結果")
-        st.markdown(f"現在株価: **{cur:,.2f}** / 投資金額: **¥{investment:,.0f}**")
+    # 市場フィルタ
+    market_filter = st.radio(
+        "市場", ["すべて", "🇺🇸 米国株", "🇯🇵 日本株"],
+        horizontal=True, key="recommend_market",
+    )
+    ETF_TICKERS = ["VOO","QQQ","SOXX","ARKK","XLF","XLE","XLV"]
+    work = df.copy()
+    if market_filter == "🇺🇸 米国株":
+        work = work[(work["market"]=="US") & (~work["ticker"].isin(ETF_TICKERS))]
+    elif market_filter == "🇯🇵 日本株":
+        work = work[work["market"]=="JP"]
+    # ETFはそもそも除外
+    work = work[~work["ticker"].isin(ETF_TICKERS)]
 
-        for pred in result["predictions"]:
-            d = pred["period_days"]
-            lab = plabels.get(d, f"{d}日後")
-            pp = pred["predicted_price"]
-            rp = pred["return_pct"]
-            pnl = investment * rp / 100
-            c = "green" if rp >= 0 else "red"
-            st.markdown(f"**{lab}予測**: {pp:,.2f} (<span style='color:{c}'>{rp:+.2f}%</span>) "
-                        f"→ 予想損益: <span style='color:{c}'>¥{pnl:+,.0f}</span>",
-                        unsafe_allow_html=True)
-            st.caption(f"80%確率: {pred['lower_80']:,.2f}~{pred['upper_80']:,.2f} | "
-                       f"95%確率: {pred['lower_95']:,.2f}~{pred['upper_95']:,.2f}")
+    # 予測をマージ
+    pred_cols = ["ticker","pred_1d_pct","pred_1d_l80","pred_1d_u80","pred_1d_l95","pred_1d_u95",
+                 "pred_7d_pct","pred_7d_l80","pred_7d_u80","pred_7d_l95","pred_7d_u95",
+                 "pred_30d_pct","pred_30d_l80","pred_30d_u80","pred_30d_l95","pred_30d_u95",
+                 "pred_1d_conf","pred_7d_conf","pred_30d_conf"]
+    keep = [c for c in pred_cols if c in pred_df.columns]
+    merged = work.merge(pred_df[keep], on="ticker", how="left")
+
+    # 上昇確率
+    merged["prob_1d"] = merged.apply(lambda r: _up_probability(r.get("pred_1d_pct"), r.get("pred_1d_l95"), r.get("pred_1d_u95")), axis=1)
+    merged["prob_7d"] = merged.apply(lambda r: _up_probability(r.get("pred_7d_pct"), r.get("pred_7d_l95"), r.get("pred_7d_u95")), axis=1)
+    merged["prob_30d"] = merged.apply(lambda r: _up_probability(r.get("pred_30d_pct"), r.get("pred_30d_l95"), r.get("pred_30d_u95")), axis=1)
+
+    # ハイブリッドスコア: 0.5×スコア正規化 + 0.5×(1週期待リターン × 上昇確率)
+    #   期待値正規化: max 15%で打ち切り → 0..1
+    def _ev_norm(pct, prob):
+        if pd.isna(pct) or pd.isna(prob):
+            return 0.0
+        ev = float(pct) * float(prob)           # 期待値（%）
+        # -5 .. +10 を 0..1 にマップ（上昇側を少し広めに取る）
+        return max(0.0, min(1.0, (ev + 5) / 15))
+
+    merged["hybrid_score"] = merged.apply(
+        lambda r: 0.5 * (float(r.get("total_score", 0) or 0)/100)
+                + 0.5 * _ev_norm(r.get("pred_7d_pct"), r.get("prob_7d")),
+        axis=1
+    ) * 100
+
+    # 予測データが欠けている銘柄は除外
+    merged = merged.dropna(subset=["pred_7d_pct", "prob_7d"])
+
+    top = merged.sort_values("hybrid_score", ascending=False).head(10).reset_index(drop=True)
+
+    if top.empty:
+        st.warning("推奨できる銘柄が見つかりませんでした。")
+        return
+
+    # サイドバー: 過去的中率
+    rates = _historical_hit_rates()
+    if rates:
+        st.sidebar.markdown("**📊 過去の方向的中率**")
+        for d, lab in [(1,"1日"), (7,"1週"), (30,"1ヶ月")]:
+            if d in rates:
+                st.sidebar.caption(f"{lab}: {rates[d]:.1f}%")
+        st.sidebar.caption("※ 50%がランダム、55%↑で良好")
+
+    # 凡例
+    st.markdown("""
+<div style="background:rgba(255,255,255,0.05);border-radius:8px;padding:10px 14px;font-size:12px;line-height:1.7;margin:4px 0 16px 0">
+<b>📖 読み方:</b> ハイブリッドスコア = 総合スコア(アナライザー) × 0.5 + 7日後期待値(予測×上昇確率) × 0.5 <br>
+<b>上昇確率</b> = 95%信頼区間から正規分布を仮定して算出したP(変化率&gt;0) <br>
+<b>80%信頼区間</b> = 10回中8回はこの範囲に収まる見込み
+</div>
+""", unsafe_allow_html=True)
+
+    # 各銘柄カード
+    for i, row in top.iterrows():
+        rank = i + 1
+        ticker = row["ticker"]
+        name = row.get("name", "")
+        price = row.get("price", 0)
+        change = row.get("change_pct", 0)
+        market = row.get("market", "")
+        sector = row.get("sector", "")
+        total_score = row.get("total_score", 0)
+        signal = row.get("signal", "")
+        hybrid = row.get("hybrid_score", 0)
+        analysis_comment = row.get("analysis_comment", "")
+        rsi = row.get("rsi_14", None)
+        pos52 = row.get("pos_52w_pct", None)
+        rev_growth = row.get("revenue_growth_pct", None)
+        risk_labels = row.get("risk_labels", "")
+        upside = row.get("upside_pct", None)
+
+        action_label, action_bg = _signal_action(signal, total_score, hybrid)
+        mkt_flag = "🇺🇸" if market == "US" else ("🇯🇵" if market == "JP" else "🌐")
+        change_color = "#27ae60" if change >= 0 else "#e74c3c"
+
+        # カードヘッダ
+        st.markdown(f"""
+<div style="background:{action_bg};border-radius:10px;padding:14px 18px;margin:8px 0">
+<div style="display:flex;justify-content:space-between;align-items:center">
+<div style="font-size:18px;font-weight:bold">
+  #{rank} {mkt_flag} <code>{ticker}</code> {name}
+  <span style="font-size:13px;font-weight:normal;color:#aaa">（{sector}）</span>
+</div>
+<div style="font-size:16px">
+  <span style="font-weight:bold">¥{price:,.2f}</span>
+  <span style="color:{change_color};margin-left:8px">{change:+.2f}%</span>
+</div>
+</div>
+<div style="margin-top:8px;font-size:13px;color:#ddd">
+  {action_label} ｜ ハイブリッドスコア: <b>{hybrid:.1f}</b> ｜ 総合スコア: {total_score:.1f} ｜ シグナル: {signal}
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+        cA, cB = st.columns([3, 2])
+
+        # 左: 予測テーブル
+        with cA:
+            st.markdown("**📈 期間別予測**")
+            pred_rows = []
+            for d, lab, hist_key in [(1,"1日後",1), (7,"1週間後",7), (30,"1ヶ月後",30)]:
+                pct = row.get(f"pred_{d}d_pct")
+                prob = row.get(f"prob_{d}d")
+                l80 = row.get(f"pred_{d}d_l80")
+                u80 = row.get(f"pred_{d}d_u80")
+                hist = rates.get(hist_key, None)
+                if pd.isna(pct):
+                    continue
+                pred_price = price * (1 + pct/100)
+                prob_str = f"{prob*100:.1f}%" if prob is not None and not pd.isna(prob) else "-"
+                hist_str = f" (過去的中率 {hist:.0f}%)" if hist is not None else ""
+                pred_rows.append({
+                    "期間": lab,
+                    "期待変化率": f"{pct:+.2f}%",
+                    "予想株価": f"{pred_price:,.2f}",
+                    "上昇確率": prob_str + hist_str,
+                    "80%信頼区間": f"[{l80:+.2f}% 〜 {u80:+.2f}%]",
+                })
+            if pred_rows:
+                st.dataframe(pd.DataFrame(pred_rows), hide_index=True, width="stretch")
+
+        # 右: 選出理由
+        with cB:
+            st.markdown("**💡 選出理由**")
+            reasons = []
+            if pd.notna(rsi):
+                if rsi <= 30:
+                    reasons.append(f"RSI {rsi:.0f}（売られすぎ反発期待）")
+                elif rsi <= 45:
+                    reasons.append(f"RSI {rsi:.0f}（やや売られすぎ）")
+            if pd.notna(pos52):
+                if pos52 <= 15:
+                    reasons.append(f"52週位置 {pos52:.0f}%（底値圏）")
+                elif pos52 <= 35:
+                    reasons.append(f"52週位置 {pos52:.0f}%（調整完了圏）")
+            if pd.notna(rev_growth) and rev_growth >= 20:
+                reasons.append(f"売上成長 +{rev_growth:.0f}%（高成長）")
+            if pd.notna(upside) and upside >= 20:
+                reasons.append(f"目標株価アップサイド +{upside:.0f}%")
+            p7 = row.get("pred_7d_pct")
+            pr7 = row.get("prob_7d")
+            if pd.notna(p7) and p7 > 0 and pr7 is not None and pr7 >= 0.55:
+                reasons.append(f"1週予測 +{p7:.1f}% × 上昇確率 {pr7*100:.0f}%")
+            if not reasons:
+                reasons.append("総合スコア上位")
+            for r in reasons:
+                st.markdown(f"- {r}")
+
+            # リスクと詳細
+            if pd.notna(risk_labels) and str(risk_labels).strip():
+                st.markdown(f"**⚠️ リスク**: {risk_labels}")
+
+            if pd.notna(analysis_comment) and str(analysis_comment).strip():
+                with st.expander("📝 アナライザーコメント"):
+                    st.caption(str(analysis_comment))
 
         st.markdown("---")
-        st.caption("80%確率: 過去のパターンから10回中8回はこの範囲に収まる見込み")
-        st.caption("95%確率: ほぼ確実にこの範囲に収まるが、範囲が広くなります")
 
-        hist_df = result["history_df"]
-        if not hist_df.empty:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=hist_df.index, y=hist_df["Close"], mode="lines", name="実績", line=dict(color="blue")))
-            from datetime import timedelta
-            ld = hist_df.index[-1]
-            pd_list, pp_list, u95, l95 = [ld],[cur],[cur],[cur]
-            for p in result["predictions"]:
-                td = ld + timedelta(days=p["period_days"])
-                pd_list.append(td); pp_list.append(p["predicted_price"])
-                u95.append(p["upper_95"]); l95.append(p["lower_95"])
-            fig.add_trace(go.Scatter(x=pd_list, y=pp_list, mode="lines+markers", name="予測", line=dict(color="red", dash="dash")))
-            fig.add_trace(go.Scatter(x=pd_list, y=u95, mode="lines", line=dict(width=0), showlegend=False))
-            fig.add_trace(go.Scatter(x=pd_list, y=l95, mode="lines", name="95%信頼区間", line=dict(width=0),
-                                      fill="tonexty", fillcolor="rgba(255,0,0,0.1)"))
-            fig.update_layout(title=f"{selected} 株価予測チャート", yaxis_title="価格", height=500)
-            st.plotly_chart(fig, use_container_width=True)
+    # まとめダウンロード用CSV
+    export_cols = ["ticker","name","sector","market","price","change_pct",
+                   "hybrid_score","total_score","signal",
+                   "pred_1d_pct","prob_1d","pred_7d_pct","prob_7d","pred_30d_pct","prob_30d",
+                   "rsi_14","pos_52w_pct","revenue_growth_pct","upside_pct","analysis_comment"]
+    avail = [c for c in export_cols if c in top.columns]
+    csv = top[avail].to_csv(index=False).encode("utf-8-sig")
+    st.download_button("📥 TOP10をCSVダウンロード", csv, file_name="top10_recommend.csv", mime="text/csv")
 
 
 # ──────────────────────────────────────────────
-# ページ6: 予測精度検証
+# ページ3: 予測精度検証
 # ──────────────────────────────────────────────
 
 def page_accuracy():
@@ -846,8 +841,5 @@ def page_accuracy():
 # ──────────────────────────────────────────────
 
 if page == "ダッシュボード": page_dashboard()
-elif page == "銘柄詳細": page_detail()
-elif page == "ポートフォリオ": page_portfolio()
-elif page == "スクリーニング": page_screening()
-elif page == "予測シミュレーション": page_prediction()
+elif page == "買い推奨TOP10": page_recommend()
 elif page == "予測精度検証": page_accuracy()
