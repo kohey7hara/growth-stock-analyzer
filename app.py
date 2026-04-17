@@ -4,6 +4,7 @@ app.py - Growth Stock Analyzer Streamlit ダッシュボード
 Usage: streamlit run app.py
 """
 
+import hashlib
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -93,7 +94,7 @@ st.set_page_config(page_title="Growth Stock Analyzer", layout="wide")
 st.sidebar.title("Growth Stock Analyzer")
 page = st.sidebar.radio(
     "ページ選択",
-    ["ダッシュボード", "買い推奨TOP10", "予測精度検証"],
+    ["ダッシュボード", "買い推奨TOP10", "バックテスト", "予測精度検証"],
 )
 
 
@@ -936,9 +937,242 @@ def page_accuracy():
 
 
 # ──────────────────────────────────────────────
+# ページ: バックテスト
+# ──────────────────────────────────────────────
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _cached_backtest(period, rebalance_freq, top_n, initial_capital, ticker_sig):
+    """OHLCV取得 + バックテストを1日キャッシュ"""
+    from backtester import (
+        get_default_tickers, fetch_historical_ohlcv, run_backtest,
+        benchmark_equity_curve,
+    )
+    tickers = get_default_tickers()
+    ohlcv = fetch_historical_ohlcv(tickers, period=period)
+    result = run_backtest(
+        tickers=tickers, period=period, rebalance_freq=rebalance_freq,
+        top_n=top_n, initial_capital=initial_capital, ohlcv=ohlcv,
+    )
+    # ベンチマーク
+    bench = {}
+    for sym, label in [("SPY", "S&P500 (SPY)"), ("^N225", "日経225")]:
+        try:
+            bench[label] = benchmark_equity_curve(sym, period, initial_capital)
+        except Exception:
+            pass
+    return result, bench
+
+
+def page_backtest():
+    st.header("📉 バックテスト（TOP10戦略の過去検証）")
+    st.caption("テクニカルのみのスコアで毎期TOP10を選び、等金額保有してリバランスする戦略を過去期間でシミュレーション。取引コスト往復10bp（0.10%）を控除。")
+
+    # 設定UI
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        period = st.selectbox("バックテスト期間", ["1y", "3y", "5y"], index=2,
+                              help="yfinanceから取得。長いほど初回数分かかる")
+    with c2:
+        freq_display = st.selectbox("リバランス頻度", ["両方（比較）", "毎週（W-FRI）", "毎月（末日）"])
+    with c3:
+        top_n = st.number_input("保有銘柄数 (TOP N)", min_value=3, max_value=30, value=10)
+    with c4:
+        initial_capital = st.number_input("初期資金 (円)", min_value=10000, value=1_000_000, step=100_000)
+
+    st.caption("💡 初回実行は5年分のOHLCVをダウンロードするため2〜5分かかります。2回目以降はキャッシュで数秒。")
+
+    if not st.button("▶ バックテストを実行", type="primary"):
+        st.info("上のボタンを押すと計算が始まります。")
+        return
+
+    # ティッカー署名（univ変更検知用、現状は latest_analysis のhash）
+    from backtester import get_default_tickers
+    tickers = get_default_tickers()
+    ticker_sig = hashlib.md5(",".join(sorted(tickers)).encode()).hexdigest()[:8] if tickers else ""
+
+    if not tickers:
+        st.error("data/latest_analysis.csv が見つかりません。先に `python run.py` を実行してください。")
+        return
+
+    freqs = []
+    if freq_display == "両方（比較）":
+        freqs = [("weekly", "毎週"), ("monthly", "毎月")]
+    elif freq_display.startswith("毎週"):
+        freqs = [("weekly", "毎週")]
+    else:
+        freqs = [("monthly", "毎月")]
+
+    results = {}
+    for freq_code, freq_label in freqs:
+        with st.spinner(f"{freq_label}リバランスで計算中...（初回は数分かかります）"):
+            try:
+                result, bench = _cached_backtest(period, freq_code, top_n, initial_capital, ticker_sig)
+                results[freq_label] = (result, bench)
+            except Exception as e:
+                st.error(f"{freq_label}: {e}")
+                return
+
+    if not results:
+        st.error("計算に失敗しました。")
+        return
+
+    # === サマリーKPI ===
+    st.markdown("## 📊 パフォーマンスサマリー")
+    n_freq = len(results)
+    cols = st.columns(n_freq)
+    for col, (freq_label, (result, bench)) in zip(cols, results.items()):
+        m = result["metrics"]
+        ret_color = "#27ae60" if m["annual_return_pct"] >= 0 else "#e74c3c"
+        dd_color = "#e74c3c" if m["max_drawdown_pct"] < -20 else "#f39c12"
+        col.markdown(f"""
+<div style="border:1px solid rgba(255,255,255,0.2);border-radius:8px;padding:14px">
+<div style="font-size:14px;color:#aaa">▶ {freq_label}リバランス</div>
+<div style="font-size:12px;color:#888;margin-top:4px">期間: {m['period_years']}年 / {m['n_rebalances']}回</div>
+
+<div style="margin-top:12px">
+  <div style="font-size:11px;color:#aaa">年率リターン</div>
+  <div style="font-size:24px;font-weight:bold;color:{ret_color}">{m['annual_return_pct']:+.2f}%</div>
+</div>
+
+<div style="margin-top:8px">
+  <div style="font-size:11px;color:#aaa">累積リターン</div>
+  <div style="font-size:16px;font-weight:bold;color:{ret_color}">{m['total_return_pct']:+.2f}%</div>
+  <div style="font-size:11px;color:#888">¥{m['initial']:,.0f} → ¥{m['final']:,.0f}</div>
+</div>
+
+<div style="display:flex;gap:16px;margin-top:10px">
+  <div>
+    <div style="font-size:11px;color:#aaa">Sharpe</div>
+    <div style="font-size:16px;font-weight:bold">{m['sharpe_ratio']}</div>
+  </div>
+  <div>
+    <div style="font-size:11px;color:#aaa">最大DD</div>
+    <div style="font-size:16px;font-weight:bold;color:{dd_color}">{m['max_drawdown_pct']:.1f}%</div>
+  </div>
+  <div>
+    <div style="font-size:11px;color:#aaa">勝率</div>
+    <div style="font-size:16px;font-weight:bold">{m['win_rate_pct']}%</div>
+  </div>
+  <div>
+    <div style="font-size:11px;color:#aaa">年ボラ</div>
+    <div style="font-size:16px;font-weight:bold">{m['annual_volatility_pct']}%</div>
+  </div>
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+    # === 資産推移チャート ===
+    st.markdown("## 📈 資産推移（vs ベンチマーク）")
+    import plotly.graph_objects as go
+    fig = go.Figure()
+
+    colors = ["#27ae60", "#3498db"]
+    for i, (freq_label, (result, bench)) in enumerate(results.items()):
+        eq = result["equity_curve"]
+        fig.add_trace(go.Scatter(
+            x=eq["date"], y=eq["equity"],
+            name=f"TOP{top_n} {freq_label}",
+            line=dict(color=colors[i % len(colors)], width=2.5),
+        ))
+
+    # ベンチマーク（どれか1つから取得）
+    first_bench = list(results.values())[0][1]
+    bench_colors = ["#95a5a6", "#e74c3c"]
+    for i, (lbl, bdf) in enumerate(first_bench.items()):
+        if bdf.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=bdf["date"], y=bdf["equity"],
+            name=lbl,
+            line=dict(color=bench_colors[i % len(bench_colors)], width=1.5, dash="dash"),
+        ))
+
+    fig.update_layout(
+        yaxis_title="資産評価額（円）",
+        xaxis_title="日付",
+        height=500,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # === ベンチマーク比較テーブル ===
+    st.markdown("### 📊 ベンチマーク比較")
+    comp_rows = []
+    # 戦略
+    for freq_label, (result, _) in results.items():
+        m = result["metrics"]
+        comp_rows.append({
+            "戦略/ベンチ": f"TOP{top_n} {freq_label}",
+            "累積リターン": f"{m['total_return_pct']:+.2f}%",
+            "年率リターン": f"{m['annual_return_pct']:+.2f}%",
+            "年率ボラ": f"{m['annual_volatility_pct']:.2f}%",
+            "Sharpe": m["sharpe_ratio"],
+            "最大DD": f"{m['max_drawdown_pct']:.2f}%",
+        })
+    # ベンチマーク
+    initial = initial_capital
+    for lbl, bdf in first_bench.items():
+        if bdf.empty:
+            continue
+        first = bdf["equity"].iloc[0]
+        final = bdf["equity"].iloc[-1]
+        days = (bdf["date"].iloc[-1] - bdf["date"].iloc[0]).days
+        years = max(days/365.25, 0.01)
+        total_r = (final-first)/first*100
+        annual_r = ((final/first)**(1/years)-1)*100
+        rets = bdf["equity"].pct_change().dropna()
+        daily_vol = rets.std() * np.sqrt(252) * 100 if len(rets) > 0 else 0
+        cummax = bdf["equity"].cummax()
+        dd = ((bdf["equity"]-cummax)/cummax*100).min()
+        sharpe = (annual_r-2)/daily_vol if daily_vol > 0 else 0
+        comp_rows.append({
+            "戦略/ベンチ": lbl,
+            "累積リターン": f"{total_r:+.2f}%",
+            "年率リターン": f"{annual_r:+.2f}%",
+            "年率ボラ": f"{daily_vol:.2f}%",
+            "Sharpe": round(sharpe, 2),
+            "最大DD": f"{dd:.2f}%",
+        })
+    st.dataframe(pd.DataFrame(comp_rows), hide_index=True, use_container_width=True)
+
+    # === 取引履歴ダイジェスト ===
+    st.markdown("## 📋 取引履歴ダイジェスト")
+    for freq_label, (result, _) in results.items():
+        trades = result["trades"]
+        if trades.empty:
+            continue
+        with st.expander(f"▶ {freq_label}リバランス - {len(trades)}件の取引"):
+            # 直近の取引20件
+            st.markdown("**直近の取引（新しい順）**")
+            recent = trades.sort_values("date", ascending=False).head(20).copy()
+            recent["date"] = pd.to_datetime(recent["date"]).dt.strftime("%Y-%m-%d")
+            display_cols = [c for c in ["date", "ticker", "action", "shares", "price", "value", "score"] if c in recent.columns]
+            st.dataframe(recent[display_cols], hide_index=True, use_container_width=True)
+
+            # 頻出銘柄 TOP10
+            buys = trades[trades["action"] == "buy"]
+            if not buys.empty:
+                st.markdown("**頻繁に選ばれた銘柄 TOP10**")
+                counts = buys.groupby("ticker").size().reset_index(name="選出回数").sort_values("選出回数", ascending=False).head(10)
+                st.dataframe(counts, hide_index=True, use_container_width=True)
+
+    # === 免責 ===
+    st.markdown("---")
+    st.caption("""
+⚠️ **バックテストの限界と注意点:**
+- テクニカル指標のみでスコアリングしているため、ファンダメンタル変化（決算、業績修正）は反映されていません
+- 現universe（118銘柄）は現時点で存在する銘柄なので、Survivorship Bias（生存者バイアス）があります
+- 取引コスト10bp（往復0.10%）を差し引いていますが、実際の市場インパクト、税金は含まれていません
+- **過去の実績は将来のリターンを保証しません**
+""")
+
+
+# ──────────────────────────────────────────────
 # ルーティング
 # ──────────────────────────────────────────────
 
 if page == "ダッシュボード": page_dashboard()
 elif page == "買い推奨TOP10": page_recommend()
+elif page == "バックテスト": page_backtest()
 elif page == "予測精度検証": page_accuracy()
