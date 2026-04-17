@@ -189,10 +189,12 @@ def evaluate_predictions():
                     continue
 
                 # 各予測ホライズンを評価
+                # v6: 1日予測を廃止し、7日/30日/90日に再設計
+                # （過去のCSVに pred_1d_pct があっても評価しない＝旧データは履歴として残すのみ）
                 horizons = [
-                    ("1日後", 1, "pred_1d_pct"),
                     ("1週後", 7, "pred_7d_pct"),
                     ("1ヶ月後", 30, "pred_30d_pct"),
+                    ("3ヶ月後", 90, "pred_90d_pct"),
                 ]
 
                 for horizon_name, horizon_days, col_name in horizons:
@@ -284,9 +286,9 @@ def get_accuracy_summary(result_df=None):
     direction_accuracy = evaluated["direction_correct"].mean() * 100 if len(evaluated) > 0 else 0
     avg_error = evaluated["error_pct"].abs().mean() if len(evaluated) > 0 else 0
 
-    # ホライズン別の精度
+    # ホライズン別の精度 (v6: 1日後を削除、3ヶ月後を追加)
     horizon_stats = {}
-    for horizon in ["1日後", "1週後", "1ヶ月後"]:
+    for horizon in ["1週後", "1ヶ月後", "3ヶ月後"]:
         h_df = evaluated[evaluated["horizon"] == horizon]
         if len(h_df) > 0:
             horizon_stats[horizon] = {

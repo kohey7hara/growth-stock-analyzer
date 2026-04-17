@@ -610,45 +610,47 @@ def _predict_direction_full(close, high, low, volume, horizon_days,
     }
 
     # Step 3: レジーム×ホライズンに応じた7ファクター重み付け
+    # v6: 1日予測を廃止し、7日/30日/90日の3ホライズンに再設計
+    #      90日は中長期のためファンダメンタル比重を最大化
     if regime == "STRONG_TREND":
-        if horizon_days <= 1:
-            weights = {"トレンド": 0.28, "オシレーター": 0.04, "モメンタム": 0.28,
-                       "ボリューム": 0.15, "回帰": 0.03,
-                       "ファンダメンタル": 0.07, "マクロ": 0.15}
-        elif horizon_days <= 7:
+        if horizon_days <= 7:
             weights = {"トレンド": 0.30, "オシレーター": 0.04, "モメンタム": 0.18,
                        "ボリューム": 0.10, "回帰": 0.08,
                        "ファンダメンタル": 0.15, "マクロ": 0.15}
-        else:
+        elif horizon_days <= 30:
             weights = {"トレンド": 0.15, "オシレーター": 0.05, "モメンタム": 0.08,
                        "ボリューム": 0.05, "回帰": 0.22,
                        "ファンダメンタル": 0.30, "マクロ": 0.15}
+        else:  # 90日: 中長期はファンダ主導
+            weights = {"トレンド": 0.08, "オシレーター": 0.03, "モメンタム": 0.04,
+                       "ボリューム": 0.03, "回帰": 0.17,
+                       "ファンダメンタル": 0.50, "マクロ": 0.15}
     elif regime == "WEAK_TREND":
-        if horizon_days <= 1:
-            weights = {"トレンド": 0.22, "オシレーター": 0.10, "モメンタム": 0.18,
-                       "ボリューム": 0.10, "回帰": 0.10,
-                       "ファンダメンタル": 0.12, "マクロ": 0.18}
-        elif horizon_days <= 7:
+        if horizon_days <= 7:
             weights = {"トレンド": 0.20, "オシレーター": 0.10, "モメンタム": 0.10,
                        "ボリューム": 0.08, "回帰": 0.17,
                        "ファンダメンタル": 0.18, "マクロ": 0.17}
-        else:
+        elif horizon_days <= 30:
             weights = {"トレンド": 0.12, "オシレーター": 0.05, "モメンタム": 0.05,
                        "ボリューム": 0.05, "回帰": 0.28,
                        "ファンダメンタル": 0.30, "マクロ": 0.15}
+        else:  # 90日
+            weights = {"トレンド": 0.06, "オシレーター": 0.03, "モメンタム": 0.03,
+                       "ボリューム": 0.03, "回帰": 0.20,
+                       "ファンダメンタル": 0.50, "マクロ": 0.15}
     else:  # RANGE
-        if horizon_days <= 1:
-            weights = {"トレンド": 0.10, "オシレーター": 0.22, "モメンタム": 0.05,
-                       "ボリューム": 0.10, "回帰": 0.22,
-                       "ファンダメンタル": 0.13, "マクロ": 0.18}
-        elif horizon_days <= 7:
+        if horizon_days <= 7:
             weights = {"トレンド": 0.08, "オシレーター": 0.15, "モメンタム": 0.03,
                        "ボリューム": 0.05, "回帰": 0.29,
                        "ファンダメンタル": 0.22, "マクロ": 0.18}
-        else:
+        elif horizon_days <= 30:
             weights = {"トレンド": 0.05, "オシレーター": 0.08, "モメンタム": 0.02,
                        "ボリューム": 0.03, "回帰": 0.32,
                        "ファンダメンタル": 0.35, "マクロ": 0.15}
+        else:  # 90日
+            weights = {"トレンド": 0.03, "オシレーター": 0.05, "モメンタム": 0.02,
+                       "ボリューム": 0.02, "回帰": 0.20,
+                       "ファンダメンタル": 0.53, "マクロ": 0.15}
 
     # 加重平均方向スコア
     direction_score = sum(factors[k] * weights[k] for k in factors)
@@ -714,9 +716,9 @@ def _detect_market(ticker):
 
 
 def predict_stock(ticker, periods=None):
-    """レジーム適応型確率予測 v5"""
+    """レジーム適応型確率予測 v6 (1日予測廃止、90日追加)"""
     if periods is None:
-        periods = [1, 7, 30]
+        periods = [7, 30, 90]
 
     hist_df = _fetch_history(ticker)
     if hist_df.empty:
@@ -760,7 +762,7 @@ def predict_stock(ticker, periods=None):
     return {
         "ticker": ticker,
         "current_price": cur,
-        "engine": "regime_adaptive_v5",
+        "engine": "regime_adaptive_v6",
         "factors": all_factors,
         "volatility": volatility,
         "regime": regime_info,
@@ -771,7 +773,7 @@ def predict_stock(ticker, periods=None):
 
 def predict_all_stocks(tickers):
     """全銘柄の予測を実行してDataFrameで返す"""
-    periods = [1, 7, 30]
+    periods = [7, 30, 90]
     rows = []
 
     for tk in tickers:

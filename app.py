@@ -58,7 +58,8 @@ def get_prediction_for_ticker(ticker, pred_df):
     out = {}
     if base_price is not None and pd.notna(base_price):
         out["base_price"] = float(base_price)
-    for d in [1, 7, 30]:
+    # v6: 1日予測を廃止し、7日/30日/90日を使う
+    for d in [7, 30, 90]:
         pct = r.get(f"pred_{d}d_pct")
         if pd.notna(pct):
             out[f"p{d}"] = float(pct)
@@ -201,12 +202,12 @@ def page_dashboard():
         ["すべて", "🇺🇸 米国株", "🇯🇵 日本株", "📈 ETF"],
         horizontal=True,
     )
-    st.caption("📊 5つのAIエージェント（テクニカル・モメンタム・リバーサル・ボラティリティ・トレンド）のアンサンブル予測")
+    st.caption("📊 レジーム適応型予測エンジン v6（1日予測は廃止、中期以上に集中）")
     st.caption("前日比: 前営業日の終値からの変動率 | 予測: 本日の終値を起点にした予測変動率")
     pred_headers = {
-        1: ("1日後予測", "5エージェントの総合予測。短期の方向性は比較的信頼できる"),
-        7: ("1週後予測", "1週間後の総合予測。イベントリスクで変動の可能性あり"),
-        30: ("1月後予測", "1ヶ月後の総合予測。決算や材料で大きく変動する可能性あり"),
+        7: ("1週後予測", "1週間後の総合予測。モメンタム寄り。過去的中率60%前後で実用水準"),
+        30: ("1ヶ月後予測", "1ヶ月後の総合予測。モメンタム+ファンダ半々。スイング判断の主軸"),
+        90: ("3ヶ月後予測", "3ヶ月後の総合予測。ファンダメンタル主導。中長期投資判断の目安"),
     }
 
     pred_df = load_predictions()
@@ -366,16 +367,16 @@ def _up_probability(expected_pct, l95, u95):
 
 
 def _historical_hit_rates():
-    """horizon別の過去的中率を返す（サイドバーに表示する指標）"""
+    """horizon別の過去的中率を返す（TOP10画面の的中率パネル用）"""
     try:
         acc_path = DATA_DIR / "prediction_accuracy.csv"
         if not acc_path.exists():
             return {}
         acc = pd.read_csv(acc_path)
         rates = {}
-        # horizon_days 列で正規化
+        # v6: 7日/30日/90日を対象。1日は廃止（ただし過去データとしてCSVには残る）
         if "horizon_days" in acc.columns:
-            for d in [1, 7, 30]:
+            for d in [7, 30, 90]:
                 sub = acc[acc["horizon_days"] == d]
                 if len(sub):
                     rates[d] = sub["direction_correct"].mean() * 100
@@ -438,7 +439,7 @@ def _hit_rate_badge(hit_rate):
 
 def page_recommend():
     st.header("💎 今買うべき銘柄 TOP10")
-    st.caption("スコア × 予測ハイブリッドで並び替えた、中期で最も買い妙味のある10銘柄。1日/1週/1ヶ月後の期待変化率・上昇確率・80%信頼区間つき。")
+    st.caption("スコア × 予測ハイブリッドで並び替えた、中期で最も買い妙味のある10銘柄。1週/1ヶ月/3ヶ月後の期待変化率・上昇確率・80%信頼区間つき。")
 
     df = load_analysis()
     pred_df = load_predictions()
@@ -491,18 +492,19 @@ def page_recommend():
     # ETFはそもそも除外
     work = work[~work["ticker"].isin(ETF_TICKERS)]
 
-    # 予測をマージ
-    pred_cols = ["ticker","pred_1d_pct","pred_1d_l80","pred_1d_u80","pred_1d_l95","pred_1d_u95",
+    # 予測をマージ (v6: 7日/30日/90日)
+    pred_cols = ["ticker",
                  "pred_7d_pct","pred_7d_l80","pred_7d_u80","pred_7d_l95","pred_7d_u95",
                  "pred_30d_pct","pred_30d_l80","pred_30d_u80","pred_30d_l95","pred_30d_u95",
-                 "pred_1d_conf","pred_7d_conf","pred_30d_conf"]
+                 "pred_90d_pct","pred_90d_l80","pred_90d_u80","pred_90d_l95","pred_90d_u95",
+                 "pred_7d_conf","pred_30d_conf","pred_90d_conf"]
     keep = [c for c in pred_cols if c in pred_df.columns]
     merged = work.merge(pred_df[keep], on="ticker", how="left")
 
     # 上昇確率
-    merged["prob_1d"] = merged.apply(lambda r: _up_probability(r.get("pred_1d_pct"), r.get("pred_1d_l95"), r.get("pred_1d_u95")), axis=1)
     merged["prob_7d"] = merged.apply(lambda r: _up_probability(r.get("pred_7d_pct"), r.get("pred_7d_l95"), r.get("pred_7d_u95")), axis=1)
     merged["prob_30d"] = merged.apply(lambda r: _up_probability(r.get("pred_30d_pct"), r.get("pred_30d_l95"), r.get("pred_30d_u95")), axis=1)
+    merged["prob_90d"] = merged.apply(lambda r: _up_probability(r.get("pred_90d_pct"), r.get("pred_90d_l95"), r.get("pred_90d_u95")), axis=1)
 
     # ハイブリッドスコア: 0.5×スコア正規化 + 0.5×(1週期待リターン × 上昇確率)
     #   期待値正規化: max 15%で打ち切り → 0..1
@@ -546,10 +548,10 @@ def page_recommend():
 - 1ヶ月の区間が [-18% 〜 +37%] のように広い場合、期待値がプラスでも下振れリスクが大きい
 """)
 
-    # 過去的中率テーブル（本編）
+    # 過去的中率テーブル（本編） v6: 7/30/90日
     if rates:
         cols = st.columns(3)
-        for col, (d, lab) in zip(cols, [(1,"1日後"), (7,"1週後"), (30,"1ヶ月後")]):
+        for col, (d, lab) in zip(cols, [(7,"1週後"), (30,"1ヶ月後"), (90,"3ヶ月後")]):
             h = rates.get(d)
             if h is None:
                 col.metric(lab + " 的中率", "-")
@@ -623,7 +625,7 @@ def page_recommend():
 <th style="padding:6px 8px">80%信頼区間</th>
 </tr></thead><tbody>
 """)
-            for d, lab in [(1,"1日後"), (7,"1週間後"), (30,"1ヶ月後")]:
+            for d, lab in [(7,"1週間後"), (30,"1ヶ月後"), (90,"3ヶ月後")]:
                 pct = row.get(f"pred_{d}d_pct")
                 prob = row.get(f"prob_{d}d")
                 l80 = row.get(f"pred_{d}d_l80")
@@ -692,7 +694,7 @@ def page_recommend():
     # まとめダウンロード用CSV
     export_cols = ["ticker","name","sector","market","price","change_pct",
                    "hybrid_score","total_score","signal",
-                   "pred_1d_pct","prob_1d","pred_7d_pct","prob_7d","pred_30d_pct","prob_30d",
+                   "pred_7d_pct","prob_7d","pred_30d_pct","prob_30d","pred_90d_pct","prob_90d",
                    "rsi_14","pos_52w_pct","revenue_growth_pct","upside_pct","analysis_comment"]
     avail = [c for c in export_cols if c in top.columns]
     csv = top[avail].to_csv(index=False).encode("utf-8-sig")
@@ -749,7 +751,8 @@ def page_accuracy():
 
     # === ホライズン別精度 ===
     st.subheader("予測期間別の精度")
-    horizon_order = ["1日後", "1週後", "1ヶ月後"]
+    # v6: 7日/30日/90日がメイン。1日後は過去データとして参考表示
+    horizon_order = ["1週後", "1ヶ月後", "3ヶ月後", "1日後"]
     horizon_data = []
     for h in horizon_order:
         h_df = acc_df[acc_df["horizon"] == h]
@@ -777,7 +780,8 @@ def page_accuracy():
 
     fc1, fc2, fc3 = st.columns(3)
     with fc1:
-        horizon_filter = fc1.selectbox("予測期間", ["1日後"] + [h for h in horizon_order if h != "1日後"])
+        # v6: デフォルトは1週後（実用的で最新）
+        horizon_filter = fc1.selectbox("予測期間", ["1週後"] + [h for h in horizon_order if h != "1週後"])
     with fc2:
         result_filter = fc2.selectbox("結果", ["すべて", "◎的中のみ", "✕外れのみ"])
     with fc3:
@@ -869,8 +873,9 @@ def page_accuracy():
     st.markdown("---")
 
     # === 銘柄別的中率ランキング ===
-    st.subheader("銘柄別 的中率ランキング")
-    oneday = acc_df[acc_df["horizon"] == "1日後"]
+    # v6: 1週後を基準にランキング（実用的なホライゾン）
+    st.subheader("銘柄別 的中率ランキング（1週後予測基準）")
+    oneday = acc_df[acc_df["horizon"] == "1週後"]
     if not oneday.empty:
         ticker_stats = oneday.groupby("ticker").agg(
             name=("name", "first"),
@@ -912,7 +917,7 @@ def page_accuracy():
 
     # === 的中率チャート（日別推移） ===
     if len(acc_df["prediction_date"].unique()) > 1:
-        st.subheader("方向的中率の推移（1日後予測）")
+        st.subheader("方向的中率の推移（1週後予測）")
         oneday_daily = oneday.groupby("prediction_date").agg(
             accuracy=("direction_correct", "mean"),
             count=("direction_correct", "count")
