@@ -1,0 +1,6 @@
+ticker,name,buy_price,quantity,buy_date,note
+# 例: 以下のようにご自身の保有銘柄を記入してから、ファイル名を portfolio.csv に変更してください。
+# 値段は通貨単位を含めず数値のみ。日本株は¥、米国株は$ で読み替え。
+# ZS,Zscaler,135.00,10,2026-04-29,Zscaler打診買い
+# 4478,freee,2230,100,2026-04-29,SaaS割安狙い
+# DDOG,Datadog,131.00,8,2026-04-29,クラウド監視
