@@ -563,7 +563,173 @@ def _factor_macro(ticker, market="US"):
 
 
 # ==========================================
-# 予測コア — レジーム適応型 v5
+# F8: ニュースセンチメントファクター
+# ==========================================
+
+def _load_sentiment(ticker):
+    """latest_sentiment.csv からセンチメントデータを読み込む"""
+    try:
+        path = BASE_DIR / "data" / "latest_sentiment.csv"
+        if not path.exists():
+            return None
+        df = pd.read_csv(path)
+        row = df[df["ticker"] == ticker]
+        if row.empty:
+            return None
+        return row.iloc[0].to_dict()
+    except Exception:
+        return None
+
+
+def _factor_sentiment(ticker):
+    """
+    F8: ニュースセンチメントファクター
+    - Google Trends: 注目度の急上昇/低下（トレンド比率）
+    - Reddit: メンション数、ブル/ベア比率
+    - combined_sentiment: 統合スコア（-100〜+100）
+
+    注目度の急上昇は短期的な方向性を示唆する。
+    「みんなが注目している銘柄」は動きが大きくなる。
+    Returns: -1.0 ~ +1.0
+    """
+    data = _load_sentiment(ticker)
+    if data is None:
+        return 0.0
+
+    scores = []
+
+    # combined_sentiment（-100〜+100を-1〜+1に正規化）
+    cs = data.get("combined_sentiment")
+    if cs is not None and pd.notna(cs):
+        cs = float(cs)
+        # 強いシグナル: |cs| > 50
+        if cs > 60:
+            scores.append(0.7)
+        elif cs > 30:
+            scores.append(0.4)
+        elif cs > 10:
+            scores.append(0.15)
+        elif cs < -60:
+            scores.append(-0.7)
+        elif cs < -30:
+            scores.append(-0.4)
+        elif cs < -10:
+            scores.append(-0.15)
+        else:
+            scores.append(0.0)
+
+    # Google Trends トレンド比率（1.0超 = 注目度上昇中）
+    gtr = data.get("gtrends_trend_ratio")
+    is_trending = data.get("gtrends_is_trending", False)
+    if gtr is not None and pd.notna(gtr):
+        gtr = float(gtr)
+        if is_trending or gtr > 1.4:
+            # 注目度急上昇 → 大きな動きが来る
+            # combined_sentimentの方向に沿って強化
+            if cs is not None and cs > 0:
+                scores.append(0.4)  # ポジティブ注目
+            elif cs is not None and cs < 0:
+                scores.append(-0.4)  # ネガティブ注目
+            else:
+                scores.append(0.1)  # 方向不明だが注目度高い
+        elif gtr < 0.6:
+            scores.append(-0.1)  # 注目度低下 = 方向感なし
+
+    # Reddit メンション数
+    reddit = data.get("reddit_mentions", 0)
+    if reddit is not None and pd.notna(reddit) and float(reddit) > 0:
+        reddit = float(reddit)
+        bullish = float(data.get("reddit_bullish", 0) or 0)
+        bearish = float(data.get("reddit_bearish", 0) or 0)
+        total = bullish + bearish
+        if total > 0:
+            bull_ratio = bullish / total
+            if bull_ratio > 0.7:
+                scores.append(0.4)
+            elif bull_ratio > 0.55:
+                scores.append(0.2)
+            elif bull_ratio < 0.3:
+                scores.append(-0.4)
+            elif bull_ratio < 0.45:
+                scores.append(-0.2)
+        # メンション数が多いこと自体 = ボラティリティ拡大予測
+        if reddit > 10:
+            scores.append(0.1)  # 注目度高い（方向は他で判定）
+
+    if not scores:
+        return 0.0
+    return np.clip(np.mean(scores), -1.0, 1.0)
+
+
+# ==========================================
+# F9: 出来高プロファイルファクター（CSV活用版）
+# ==========================================
+
+def _factor_volume_profile(ticker):
+    """
+    F9: 出来高プロファイルファクター（CSVの計算済みデータ活用）
+    - vol_ratio: 5日出来高/20日平均（1.5超 = 異常出来高）
+    - 出来高の方向（増加中/減少中）
+    - 価格方向 × 出来高方向 の確認/否定
+
+    「出来高は嘘をつかない」— 出来高を伴う動きは本物、
+    出来高なしの動きはフェイクの可能性が高い。
+    Returns: -1.0 ~ +1.0
+    """
+    data = _load_stock_fundamentals(ticker)  # latest_data.csvから
+    if data is None:
+        return 0.0
+
+    scores = []
+
+    # vol_ratio (5日/20日平均)
+    vr = data.get("vol_ratio")
+    change_pct = data.get("change_pct")
+
+    if vr is not None and pd.notna(vr) and change_pct is not None and pd.notna(change_pct):
+        vr = float(vr)
+        change_pct = float(change_pct)
+        price_dir = 1 if change_pct > 0 else (-1 if change_pct < 0 else 0)
+
+        if vr > 2.0:
+            # 異常出来高 → 大口が動いている、方向を強く信頼
+            scores.append(np.clip(price_dir * 0.8, -1, 1))
+        elif vr > 1.5:
+            # 出来高増加 → 方向を確認
+            scores.append(np.clip(price_dir * 0.5, -1, 1))
+        elif vr > 1.2:
+            # やや増加
+            scores.append(np.clip(price_dir * 0.25, -1, 1))
+        elif vr < 0.6:
+            # 出来高激減 → 現在の動きは弱い、逆方向バイアス
+            scores.append(np.clip(-price_dir * 0.3, -1, 1))
+        elif vr < 0.8:
+            # 出来高やや減
+            scores.append(np.clip(-price_dir * 0.1, -1, 1))
+        else:
+            scores.append(0.0)
+
+    # RSIとの組み合わせ（過熱 + 出来高増 = トレンド強い、過熱 + 出来高減 = 反転近い）
+    rsi = data.get("rsi_14")
+    if rsi is not None and pd.notna(rsi) and vr is not None and pd.notna(vr):
+        rsi = float(rsi)
+        vr = float(vr)
+        if rsi > 70 and vr < 0.8:
+            scores.append(-0.3)  # 過熱 + 出来高減 → 反転警告
+        elif rsi < 30 and vr > 1.3:
+            scores.append(0.3)  # 売られすぎ + 出来高増 → 底打ちサイン
+        elif rsi > 70 and vr > 1.5:
+            scores.append(0.2)  # 過熱だが出来高伴う → まだ上がる
+        elif rsi < 30 and vr < 0.7:
+            scores.append(-0.2)  # 売られすぎ + 出来高減 → まだ下がる
+
+    if not scores:
+        return 0.0
+    return np.clip(np.mean(scores), -1.0, 1.0)
+
+
+# ==========================================
+# 予測コア — レジーム適応型 v6（9ファクター）
 # ==========================================
 
 def _predict_direction(close, volume, horizon_days):
@@ -580,24 +746,27 @@ def _predict_direction(close, volume, horizon_days):
 def _predict_direction_full(close, high, low, volume, horizon_days,
                             ticker="", market="US"):
     """
-    レジーム適応型予測コア v5（7ファクター）。
+    レジーム適応型予測コア v6（9ファクター）。
 
-    v4→v5:
-    - ファンダメンタル(F6) + マクロ(F7)ファクター追加
-    - 長期予測でファンダメンタルの重みを大きくする
-    - マクロ環境を全ホライズンで考慮
+    v5→v6:
+    - センチメント(F8): ニュース・SNS感情分析（Google Trends + Reddit）
+    - 出来高プロファイル(F9): 異常出来高×価格方向の複合シグナル
+    - ユーザー要望: 「ニュースのポジティブ/ネガティブ」「取引量」が株価を動かす
+    - 短期ほどセンチメント・出来高プロファイルの重みを大きく設定
     """
     # Step 1: レジーム判定
     regime, trend_dir, strength = _detect_regime(close, high, low, volume)
 
-    # Step 2: 7ファクターを計算
+    # Step 2: 9ファクターを計算
     f_trend = _factor_trend(close)
     f_osc = _factor_oscillator(close, regime, trend_dir)
     f_mom = _factor_momentum(close)
     f_vol = _factor_volume(close, volume)
     f_rev = _factor_reversion(close, regime, trend_dir)
-    f_fund = _factor_fundamental(ticker)  # ★ NEW: ファンダメンタル
-    f_macro = _factor_macro(ticker, market)  # ★ NEW: マクロ環境
+    f_fund = _factor_fundamental(ticker)
+    f_macro = _factor_macro(ticker, market)
+    f_sent = _factor_sentiment(ticker)         # ★ v6: ニュース感情
+    f_volp = _factor_volume_profile(ticker)    # ★ v6: 出来高プロファイル
 
     factors = {
         "トレンド": f_trend,
@@ -607,50 +776,63 @@ def _predict_direction_full(close, high, low, volume, horizon_days,
         "回帰": f_rev,
         "ファンダメンタル": f_fund,
         "マクロ": f_macro,
+        "センチメント": f_sent,
+        "出来高プロファイル": f_volp,
     }
 
-    # Step 3: レジーム×ホライズンに応じた7ファクター重み付け
-    # v6: 1日予測を廃止し、7日/30日/90日の3ホライズンに再設計
-    #      90日は中長期のためファンダメンタル比重を最大化
+    # Step 3: レジーム×ホライズンに応じた9ファクター重み付け
+    # 設計思想:
+    #   短期(7d): センチメント・出来高プロファイルが最も効く（ニュースと売買圧力が短期を支配）
+    #   中期(30d): ファンダメンタル主導だがセンチメントも残す
+    #   長期(90d): ファンダメンタル最重視、センチメントは低め（ノイズ化するため）
     if regime == "STRONG_TREND":
         if horizon_days <= 7:
-            weights = {"トレンド": 0.30, "オシレーター": 0.04, "モメンタム": 0.18,
-                       "ボリューム": 0.10, "回帰": 0.08,
-                       "ファンダメンタル": 0.15, "マクロ": 0.15}
+            weights = {"トレンド": 0.22, "オシレーター": 0.03, "モメンタム": 0.12,
+                       "ボリューム": 0.06, "回帰": 0.05,
+                       "ファンダメンタル": 0.10, "マクロ": 0.10,
+                       "センチメント": 0.18, "出来高プロファイル": 0.14}
         elif horizon_days <= 30:
-            weights = {"トレンド": 0.15, "オシレーター": 0.05, "モメンタム": 0.08,
-                       "ボリューム": 0.05, "回帰": 0.22,
-                       "ファンダメンタル": 0.30, "マクロ": 0.15}
-        else:  # 90日: 中長期はファンダ主導
-            weights = {"トレンド": 0.08, "オシレーター": 0.03, "モメンタム": 0.04,
-                       "ボリューム": 0.03, "回帰": 0.17,
-                       "ファンダメンタル": 0.50, "マクロ": 0.15}
+            weights = {"トレンド": 0.12, "オシレーター": 0.04, "モメンタム": 0.06,
+                       "ボリューム": 0.04, "回帰": 0.18,
+                       "ファンダメンタル": 0.25, "マクロ": 0.12,
+                       "センチメント": 0.12, "出来高プロファイル": 0.07}
+        else:  # 90日: 中長期はファンダ主導、センチメントは低め
+            weights = {"トレンド": 0.06, "オシレーター": 0.02, "モメンタム": 0.03,
+                       "ボリューム": 0.02, "回帰": 0.14,
+                       "ファンダメンタル": 0.42, "マクロ": 0.15,
+                       "センチメント": 0.10, "出来高プロファイル": 0.06}
     elif regime == "WEAK_TREND":
         if horizon_days <= 7:
-            weights = {"トレンド": 0.20, "オシレーター": 0.10, "モメンタム": 0.10,
-                       "ボリューム": 0.08, "回帰": 0.17,
-                       "ファンダメンタル": 0.18, "マクロ": 0.17}
+            weights = {"トレンド": 0.14, "オシレーター": 0.08, "モメンタム": 0.07,
+                       "ボリューム": 0.05, "回帰": 0.12,
+                       "ファンダメンタル": 0.12, "マクロ": 0.12,
+                       "センチメント": 0.18, "出来高プロファイル": 0.12}
         elif horizon_days <= 30:
-            weights = {"トレンド": 0.12, "オシレーター": 0.05, "モメンタム": 0.05,
-                       "ボリューム": 0.05, "回帰": 0.28,
-                       "ファンダメンタル": 0.30, "マクロ": 0.15}
+            weights = {"トレンド": 0.09, "オシレーター": 0.04, "モメンタム": 0.04,
+                       "ボリューム": 0.04, "回帰": 0.22,
+                       "ファンダメンタル": 0.25, "マクロ": 0.12,
+                       "センチメント": 0.12, "出来高プロファイル": 0.08}
         else:  # 90日
-            weights = {"トレンド": 0.06, "オシレーター": 0.03, "モメンタム": 0.03,
-                       "ボリューム": 0.03, "回帰": 0.20,
-                       "ファンダメンタル": 0.50, "マクロ": 0.15}
+            weights = {"トレンド": 0.05, "オシレーター": 0.02, "モメンタム": 0.02,
+                       "ボリューム": 0.02, "回帰": 0.17,
+                       "ファンダメンタル": 0.42, "マクロ": 0.14,
+                       "センチメント": 0.10, "出来高プロファイル": 0.06}
     else:  # RANGE
         if horizon_days <= 7:
-            weights = {"トレンド": 0.08, "オシレーター": 0.15, "モメンタム": 0.03,
-                       "ボリューム": 0.05, "回帰": 0.29,
-                       "ファンダメンタル": 0.22, "マクロ": 0.18}
+            weights = {"トレンド": 0.06, "オシレーター": 0.10, "モメンタム": 0.02,
+                       "ボリューム": 0.04, "回帰": 0.20,
+                       "ファンダメンタル": 0.15, "マクロ": 0.13,
+                       "センチメント": 0.18, "出来高プロファイル": 0.12}
         elif horizon_days <= 30:
-            weights = {"トレンド": 0.05, "オシレーター": 0.08, "モメンタム": 0.02,
-                       "ボリューム": 0.03, "回帰": 0.32,
-                       "ファンダメンタル": 0.35, "マクロ": 0.15}
+            weights = {"トレンド": 0.04, "オシレーター": 0.06, "モメンタム": 0.02,
+                       "ボリューム": 0.02, "回帰": 0.26,
+                       "ファンダメンタル": 0.28, "マクロ": 0.12,
+                       "センチメント": 0.12, "出来高プロファイル": 0.08}
         else:  # 90日
-            weights = {"トレンド": 0.03, "オシレーター": 0.05, "モメンタム": 0.02,
-                       "ボリューム": 0.02, "回帰": 0.20,
-                       "ファンダメンタル": 0.53, "マクロ": 0.15}
+            weights = {"トレンド": 0.03, "オシレーター": 0.04, "モメンタム": 0.02,
+                       "ボリューム": 0.02, "回帰": 0.16,
+                       "ファンダメンタル": 0.45, "マクロ": 0.14,
+                       "センチメント": 0.08, "出来高プロファイル": 0.06}
 
     # 加重平均方向スコア
     direction_score = sum(factors[k] * weights[k] for k in factors)
