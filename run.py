@@ -64,6 +64,23 @@ def main():
     macro_df = None
     portfolio_data = None
 
+    # Step 0: 急騰・出来高急増スキャン（ウォッチリスト外の銘柄を自動検出）
+    surge_tickers = []
+    if run_stock or run_analyze:
+        logger.info("\n[Step 0/7] 急騰・出来高急増スキャン中...")
+        try:
+            from surge_scanner import run_surge_scan, get_surge_tickers_for_prediction
+            surge_df = run_surge_scan(include_watchlist=True)
+            surge_tickers = get_surge_tickers_for_prediction()
+            if surge_tickers:
+                logger.info(f"  ★ ウォッチリスト外の急騰銘柄を検出: {surge_tickers}")
+            else:
+                logger.info(f"  ウォッチリスト外の新規急騰銘柄なし")
+        except Exception as e:
+            logger.warning(f"  急騰スキャンスキップ: {e}")
+            import traceback
+            traceback.print_exc()
+
     # Step 1: 株価データ取得
     if run_stock:
         logger.info("\n[Step 1/6] 株価データ取得中...")
@@ -150,6 +167,12 @@ def main():
                     analysis_df = pd.read_csv(ap)
             if analysis_df is not None:
                 tickers = analysis_df["ticker"].tolist()
+                # 急騰スキャナーで検出されたウォッチリスト外銘柄も追加
+                if surge_tickers:
+                    added = [t for t in surge_tickers if t not in tickers]
+                    if added:
+                        tickers.extend(added)
+                        logger.info(f"  ★ 急騰検出銘柄を予測対象に追加: {added}")
                 pred_df = predict_all_stocks(tickers)
                 logger.info(f"  完了: {len(pred_df)}銘柄の予測データ生成")
             else:

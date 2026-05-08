@@ -55,6 +55,8 @@ jobs:
           git add data/latest_predictions.csv
           git add data/prediction_accuracy.csv || true
           git add data/prediction_history/ || true
+          git add data/surge_alerts_*.csv || true
+          git add data/latest_surge_alerts.csv || true
           git add output/ || true
 
           # Check if there are changes
