@@ -5,6 +5,7 @@ Usage: streamlit run app.py
 """
 
 import hashlib
+import re
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -116,12 +117,14 @@ def compute_atr14(ohlc, period=14):
     return float(atr) if pd.notna(atr) else None
 
 
-def compute_execution_plan(ohlc, ticker, total_capital, risk_pct, usdjpy=None):
+def compute_execution_plan(ohlc, ticker, total_capital, risk_pct, usdjpy=None,
+                           max_position_frac=0.25):
     """執行プラン計算（純粋関数: OHLC DataFrameから算出。テスト可能）
 
     total_capital は円。米国株の場合は usdjpy でドル換算してから
     リスク予算・ポジション上限を計算する。
-    ポジション上限: 総資金の25%（1銘柄集中の上限）。
+    ポジション上限: 総資金の max_position_frac（デフォルト25%）。
+    3層ポートフォリオ: ③テーマ=0.05 / ②構造=0.25 / ①土台=1.0（キャップなし）。
 
     返却 dict:
       entry, stop, stop_pct, risk_per_share, shares, position_value,
@@ -152,8 +155,8 @@ def compute_execution_plan(ohlc, ticker, total_capital, risk_pct, usdjpy=None):
         capital_ccy = float(total_capital) / fx
     risk_budget = capital_ccy * float(risk_pct) / 100.0
     shares = math.floor(risk_budget / risk_per_share)
-    # ポジション上限: 総資金の25%まで（1銘柄集中の防止）
-    max_shares = math.floor(capital_ccy * 0.25 / entry) if entry > 0 else 0
+    # ポジション上限: 総資金の max_position_frac まで（1銘柄集中の防止）
+    max_shares = math.floor(capital_ccy * float(max_position_frac) / entry) if entry > 0 else 0
     capped = shares > max_shares
     shares = min(shares, max_shares)
     if jp:
@@ -177,6 +180,7 @@ def compute_execution_plan(ohlc, ticker, total_capital, risk_pct, usdjpy=None):
         "is_jp": jp,
         "capped": capped,
         "capital_ccy": capital_ccy,
+        "max_position_frac": float(max_position_frac),
     }
 
 
@@ -210,6 +214,93 @@ def get_macro_score():
 
 
 # ──────────────────────────────────────────────
+# 3層ポートフォリオ分類
+# ──────────────────────────────────────────────
+
+LAYER_FOUNDATION = "①土台"
+LAYER_QUALITY = "②構造"
+LAYER_THEME = "③テーマ"
+
+LAYER_RULES = {
+    LAYER_FOUNDATION: "損切りなし・下落時は定額買い増し（積立）。銘柄を当てない枠。配分目安50%",
+    LAYER_QUALITY: "損切り−15〜20%の構造ライン割れのみ売り。年単位保有。配分目安35%",
+    LAYER_THEME: "1銘柄は総資金5%まで・トレーリングストップ必須・+30%で半分利確。配分目安15%",
+}
+
+LAYER_BADGES = {
+    LAYER_FOUNDATION: "🟦①土台",
+    LAYER_QUALITY: "🟩②構造",
+    LAYER_THEME: "🟥③テーマ",
+}
+
+LAYER_DESC = {
+    LAYER_FOUNDATION: "インデックスETF。銘柄を当てない枠。下落はバーゲンとして定額買い増し",
+    LAYER_QUALITY: "昔からあり構造的追い風（金利のある世界・インフレ連動・電力インフラ・決済等）で伸びる実証済み企業",
+    LAYER_THEME: "直近盛り上がりの高ボラ株（AIサーバー・メモリ・量子・新興フィンテック等）",
+}
+
+# 執行プランのポジション上限（総資金比）。土台は積立前提のためキャップなし
+LAYER_MAX_POSITION_FRAC = {
+    LAYER_FOUNDATION: 1.0,
+    LAYER_QUALITY: 0.25,
+    LAYER_THEME: 0.05,
+}
+
+# 配分目安（総資金比）
+LAYER_ALLOCATION = {
+    LAYER_FOUNDATION: 0.50,
+    LAYER_QUALITY: 0.35,
+    LAYER_THEME: 0.15,
+}
+
+# 明示的な層マッピング（最優先）。日本株は .T なしの証券コードで引く
+LAYER_OVERRIDES = {
+    # ①土台: ETF全般
+    **{t: LAYER_FOUNDATION for t in [
+        "SPY", "VOO", "QQQ", "SOXX", "ARKK", "XLF", "XLE", "XLV",
+    ]},
+    # ②構造: 構造的追い風で伸びる実証済み企業
+    **{t: LAYER_QUALITY for t in [
+        "8411", "8316", "8306", "8001", "8031", "6501", "7203", "9432",
+        "2914", "6758", "7267", "4568", "8830",
+        "META", "MSFT", "AAPL", "GOOGL", "V", "MA", "LLY", "NVO",
+        "ADBE", "NFLX", "AMZN", "ISRG",
+    ]},
+    # ③テーマ: 直近盛り上がりの高ボラ株
+    **{t: LAYER_THEME for t in [
+        "SMCI", "RGTI", "MU", "MRVL", "AVGO", "AMAT", "LRCX", "NVDA",
+        "AMD", "INTC", "PLTR", "COIN", "SOFI", "AFRM", "RIVN", "CRWD",
+        "ZS", "285A", "6146", "6857", "8035", "6098",
+        "SHOP", "UBER", "SNPS", "ESTC", "HPE", "ORCL", "TSLA",
+    ]},
+}
+
+# テーマ判定キーワード（"AI" は大文字のみマッチさせ Airbnb 等の誤検知を防ぐ）
+_THEME_PATTERN = re.compile(r"半導体|AI|量子|メモリ|サーバー|暗号資産|フィンテック|crypto|quantum")
+
+
+def classify_layer(ticker, name="", sector_or_category=""):
+    """3層ポートフォリオの層を判定して (層ラベル, 層別ルール短文) を返す
+
+    優先順位:
+      1. LAYER_OVERRIDES（明示マッピング）
+      2. ETF判定（セクター/カテゴリに ETF・指数・インデックス）→ ①土台
+      3. セクター/名前にテーマキーワード（半導体|AI|量子|メモリ|サーバー|crypto|フィンテック等）→ ③テーマ
+      4. それ以外 → ②構造
+    """
+    t = str(ticker).upper().replace(".T", "").strip()
+    if t in LAYER_OVERRIDES:
+        layer = LAYER_OVERRIDES[t]
+        return layer, LAYER_RULES[layer]
+    text = f"{sector_or_category or ''} {name or ''}"
+    if ("ETF" in text.upper()) or ("指数" in text) or ("インデックス" in text):
+        return LAYER_FOUNDATION, LAYER_RULES[LAYER_FOUNDATION]
+    if _THEME_PATTERN.search(text):
+        return LAYER_THEME, LAYER_RULES[LAYER_THEME]
+    return LAYER_QUALITY, LAYER_RULES[LAYER_QUALITY]
+
+
+# ──────────────────────────────────────────────
 # ページ設定
 # ──────────────────────────────────────────────
 
@@ -217,7 +308,7 @@ st.set_page_config(page_title="Growth Stock Analyzer", layout="wide")
 st.sidebar.title("Growth Stock Analyzer")
 page = st.sidebar.radio(
     "ページ選択",
-    ["ダッシュボード", "銘柄チャート", "買い推奨TOP10", "バックテスト", "予測精度検証"],
+    ["ダッシュボード", "銘柄チャート", "3層ポートフォリオ", "買い推奨TOP10", "バックテスト", "予測精度検証"],
 )
 
 
@@ -363,10 +454,12 @@ def page_dashboard():
         else:
             search_url = f"https://www.google.com/search?q={tk}+stock+price"
 
+        _layer, _ = classify_layer(tk, name, r.get("sector", ""))
         rd = {
             "銘柄": tk,
             "名前": {"text": name, "url": search_url},
             "シグナル": short_signal(r.get("signal","")),
+            "層": LAYER_BADGES[_layer],
             "スコア": r.get("total_score",0),
             "株価": r.get("price",0),
             "前日比(%)": r.get("change_pct",0),
@@ -388,7 +481,8 @@ def page_dashboard():
 
     pred_col_names = [h for _, (h, _) in pred_headers.items()]
     header_tips = {h: tip for _, (h, tip) in pred_headers.items()}
-    all_cols = ["銘柄","名前","シグナル","スコア","株価","前日比(%)"] + pred_col_names + ["出来高比率","RSI","52週位置","リスク"]
+    header_tips["層"] = "3層ポートフォリオ分類: ①土台=ETF積立（損切りなし） / ②構造=実証済み企業（−15〜20%ライン） / ③テーマ=高ボラ株（1銘柄5%上限）"
+    all_cols = ["銘柄","名前","シグナル","層","スコア","株価","前日比(%)"] + pred_col_names + ["出来高比率","RSI","52週位置","リスク"]
 
     html = '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">'
     html += '<thead><tr style="background:#1a1a2e;color:white">'
@@ -718,11 +812,76 @@ def get_usdjpy():
     return 150.0
 
 
-def _render_execution_plan(ticker, total_capital, risk_pct):
-    """買い推奨カード内の執行プランセクションを描画"""
+def _sidebar_total_capital():
+    """サイドバーの総資金入力（買い推奨TOP10 / 3層ポートフォリオで共通のkeyを使用）
+
+    ページ切替でウィジェット状態が破棄されても値を引き継げるよう、
+    シャドウキー（_total_capital_jpy）に毎回退避する。
+    """
+    val = st.sidebar.number_input(
+        "総資金（円）", min_value=100_000,
+        value=int(st.session_state.get("_total_capital_jpy", 8_000_000)),
+        step=100_000, key="exec_total_capital",
+    )
+    st.session_state["_total_capital_jpy"] = int(val)
+    return val
+
+
+def compute_effective_prob_table(work, pred_df):
+    """予測マージ + 上昇確率・実効上昇確率・期待値・ランクスコアを算出
+
+    買い推奨TOP10 と 3層ポートフォリオで共通利用する純粋ロジック。
+    返値: (merged DataFrame, horizon別過去的中率 dict)
+    追加カラム: prob_7d, prob_30d, eff_prob_30d, ev_30d, rank_score
+    """
+    pred_cols = ["ticker",
+                 "pred_7d_pct","pred_7d_l80","pred_7d_u80","pred_7d_l95","pred_7d_u95",
+                 "pred_30d_pct","pred_30d_l80","pred_30d_u80","pred_30d_l95","pred_30d_u95",
+                 "pred_7d_conf","pred_30d_conf"]
+    keep = [c for c in pred_cols if c in pred_df.columns]
+    merged = work.merge(pred_df[keep], on="ticker", how="left")
+
+    # 上昇確率（95%信頼区間→正規分布仮定）
+    merged["prob_7d"] = merged.apply(lambda r: _up_probability(r.get("pred_7d_pct"), r.get("pred_7d_l95"), r.get("pred_7d_u95")), axis=1)
+    merged["prob_30d"] = merged.apply(lambda r: _up_probability(r.get("pred_30d_pct"), r.get("pred_30d_l95"), r.get("pred_30d_u95")), axis=1)
+
+    # 過去の方向的中率
+    rates = _historical_hit_rates()
+    hit30 = rates.get(30)
+
+    def _eff30(r):
+        eff = _effective_probability(r.get("prob_30d"), hit30)
+        if eff is None:
+            # 的中率データがない場合はモデル確率をそのまま使う
+            p = r.get("prob_30d")
+            eff = float(p) if pd.notna(p) else None
+        return eff
+
+    merged["eff_prob_30d"] = merged.apply(_eff30, axis=1)
+    # 確率加重期待値（%）= 1ヶ月期待変化率 × 実効上昇確率
+    merged["ev_30d"] = merged.apply(
+        lambda r: float(r["pred_30d_pct"]) * float(r["eff_prob_30d"])
+        if pd.notna(r.get("pred_30d_pct")) and pd.notna(r.get("eff_prob_30d")) else np.nan,
+        axis=1,
+    )
+    # ランクスコア = 実効確率(0-100) + 確率加重期待値(%) − リスク警告1件につき5点減点
+    merged["rank_score"] = merged.apply(
+        lambda r: (float(r["eff_prob_30d"]) * 100 + float(r["ev_30d"])
+                   - 5 * int(r.get("risk_count", 0) or 0))
+        if pd.notna(r.get("eff_prob_30d")) and pd.notna(r.get("ev_30d")) else np.nan,
+        axis=1,
+    )
+    return merged, rates
+
+
+def _render_execution_plan(ticker, total_capital, risk_pct, name="", sector=""):
+    """買い推奨カード内の執行プランセクションを描画（層別ポジション上限を適用）"""
     st.markdown("**📋 執行プラン**")
+    layer, _ = classify_layer(ticker, name, sector)
+    max_frac = LAYER_MAX_POSITION_FRAC.get(layer, 0.25)
     ohlc = load_ohlc_dynamic(yf_symbol(ticker), period="3mo")
-    plan = compute_execution_plan(ohlc, ticker, total_capital, risk_pct, usdjpy=get_usdjpy())
+    plan = compute_execution_plan(ohlc, ticker, total_capital, risk_pct, usdjpy=get_usdjpy(),
+                                  max_position_frac=max_frac)
     if plan is None:
         st.caption("OHLCデータが取得できないため執行プランを計算できません（ネットワーク/データ不足）。")
         return
@@ -740,7 +899,10 @@ def _render_execution_plan(ticker, total_capital, risk_pct):
     if plan["size_ok"]:
         cap_note = "（100株単位）" if plan["is_jp"] else ""
         if plan.get("capped"):
-            cap_note += "（⚠️ ポジション上限25%を適用して縮小）"
+            if layer == LAYER_THEME:
+                cap_note += "（⚠️ テーマ枠上限5%を適用して縮小）"
+            else:
+                cap_note += f"（⚠️ ポジション上限{max_frac*100:.0f}%を適用して縮小）"
         rows.append(("株数", f"{plan['shares']:,}株" + cap_note))
         pos_note = "" if plan["is_jp"] else f"（参考: 約¥{plan['position_value'] * get_usdjpy():,.0f}）"
         rows.append(("投入額", _fmt_money(plan["position_value"], cur) + pos_note))
@@ -782,11 +944,8 @@ def page_recommend():
     if _mr is not None and _mr.get("score") is not None and _mr["score"] < 60:
         st.error(f"市況判定が{_mr['score']}点のため新規エントリー非推奨（待機モード）")
 
-    # ── サイドバー: 執行プラン用の資金設定 ──
-    total_capital = st.sidebar.number_input(
-        "総資金（円）", min_value=100_000, value=8_000_000, step=100_000,
-        key="exec_total_capital",
-    )
+    # ── サイドバー: 執行プラン用の資金設定（3層ポートフォリオと共通） ──
+    total_capital = _sidebar_total_capital()
     risk_pct = st.sidebar.number_input(
         "1トレードのリスク（%）", min_value=0.5, max_value=3.0, value=1.0, step=0.1,
         key="exec_risk_pct",
@@ -843,20 +1002,8 @@ def page_recommend():
     # ETFはそもそも除外
     work = work[~work["ticker"].isin(ETF_TICKERS)]
 
-    # 予測をマージ (v6: 7日/30日/90日)
-    pred_cols = ["ticker",
-                 "pred_7d_pct","pred_7d_l80","pred_7d_u80","pred_7d_l95","pred_7d_u95",
-                 "pred_30d_pct","pred_30d_l80","pred_30d_u80","pred_30d_l95","pred_30d_u95",
-                 "pred_7d_conf","pred_30d_conf"]
-    keep = [c for c in pred_cols if c in pred_df.columns]
-    merged = work.merge(pred_df[keep], on="ticker", how="left")
-
-    # 上昇確率
-    merged["prob_7d"] = merged.apply(lambda r: _up_probability(r.get("pred_7d_pct"), r.get("pred_7d_l95"), r.get("pred_7d_u95")), axis=1)
-    merged["prob_30d"] = merged.apply(lambda r: _up_probability(r.get("pred_30d_pct"), r.get("pred_30d_l95"), r.get("pred_30d_u95")), axis=1)
-
-    # ── 過去の方向的中率（モデル成績表）──
-    rates = _historical_hit_rates()
+    # 予測マージ + 上昇確率・実効確率・ランクスコア（3層ポートフォリオと共通ロジック）
+    merged, rates = compute_effective_prob_table(work, pred_df)
 
     # ハイブリッドスコア（アクション判定用に残置）: 0.5×スコア正規化 + 0.5×(1週期待リターン × 上昇確率)
     def _ev_norm(pct, prob):
@@ -871,32 +1018,6 @@ def page_recommend():
                 + 0.5 * _ev_norm(r.get("pred_7d_pct"), r.get("prob_7d")),
         axis=1
     ) * 100
-
-    # ── ランキングスコア（一本化）: 1ヶ月実効上昇確率 × 期待値ベース ──
-    hit30 = rates.get(30)
-
-    def _eff30(r):
-        eff = _effective_probability(r.get("prob_30d"), hit30)
-        if eff is None:
-            # 的中率データがない場合はモデル確率をそのまま使う
-            p = r.get("prob_30d")
-            eff = float(p) if pd.notna(p) else None
-        return eff
-
-    merged["eff_prob_30d"] = merged.apply(_eff30, axis=1)
-    # 確率加重期待値（%）= 1ヶ月期待変化率 × 実効上昇確率
-    merged["ev_30d"] = merged.apply(
-        lambda r: float(r["pred_30d_pct"]) * float(r["eff_prob_30d"])
-        if pd.notna(r.get("pred_30d_pct")) and pd.notna(r.get("eff_prob_30d")) else np.nan,
-        axis=1,
-    )
-    # ランクスコア = 実効確率(0-100) + 確率加重期待値(%) − リスク警告1件につき5点減点
-    merged["rank_score"] = merged.apply(
-        lambda r: (float(r["eff_prob_30d"]) * 100 + float(r["ev_30d"])
-                   - 5 * int(r.get("risk_count", 0) or 0))
-        if pd.notna(r.get("eff_prob_30d")) and pd.notna(r.get("ev_30d")) else np.nan,
-        axis=1,
-    )
 
     # 予測データが欠けている銘柄は除外
     merged = merged.dropna(subset=["pred_7d_pct", "prob_7d", "pred_30d_pct", "prob_30d",
@@ -993,6 +1114,14 @@ def page_recommend():
 </div>
 """, unsafe_allow_html=True)
 
+        # 3層ポートフォリオ分類バッジ + 層別ルール
+        _layer, _layer_rule = classify_layer(ticker, name, sector)
+        st.markdown(
+            f"<div style='font-size:13px;margin:-2px 0 6px 4px'>📂 <b>{LAYER_BADGES[_layer]}枠</b>"
+            f" — {_layer_rule}</div>",
+            unsafe_allow_html=True,
+        )
+
         cA, cB = st.columns([3, 2])
 
         # 左: 予測テーブル（HTMLで色分け）
@@ -1073,8 +1202,8 @@ def page_recommend():
                 with st.expander("📝 アナライザーコメント"):
                     st.caption(str(analysis_comment))
 
-        # 執行プラン（ATRベースのエントリー/損切り/サイズ計算）
-        _render_execution_plan(ticker, total_capital, risk_pct)
+        # 執行プラン（ATRベースのエントリー/損切り/サイズ計算。層別ポジション上限を適用）
+        _render_execution_plan(ticker, total_capital, risk_pct, name=name, sector=sector)
 
         st.markdown("---")
 
@@ -1101,6 +1230,110 @@ def page_recommend():
     avail = [c for c in export_cols if c in top.columns]
     csv = top[avail].to_csv(index=False).encode("utf-8-sig")
     st.download_button("📥 TOP10をCSVダウンロード", csv, file_name="top10_recommend.csv", mime="text/csv")
+
+
+# ──────────────────────────────────────────────
+# ページ: 3層ポートフォリオ
+# ──────────────────────────────────────────────
+
+def page_portfolio():
+    st.header("🗂 3層ポートフォリオ")
+    st.caption("『当てにいく枠』と『当てない枠』を分けて運用する3層構造。層ごとに損切り・買い増し・配分のルールが異なります。")
+
+    # ── サイドバー: 総資金（買い推奨TOP10と共通key） ──
+    total_capital = _sidebar_total_capital()
+
+    # ── 冒頭: 3層の説明と配分目安 ──
+    st.markdown("""
+- **①土台（コア）** — インデックスETF。**銘柄を当てない枠**。損切りなし・下落時は定額買い増し
+- **②構造（クオリティ）** — 昔からあり構造的追い風（金利のある世界・インフレ連動・電力インフラ・決済等）で伸びる**実証済み企業**。損切り−15〜20%の構造ライン。年単位保有
+- **③テーマ（モメンタム）** — 直近盛り上がりの**高ボラ株**（AIサーバー・メモリ・量子・新興フィンテック等）。1銘柄は総資金の5%まで・トレーリングストップ必須・+30%で半分利確
+""")
+
+    alloc_rows = []
+    for layer in [LAYER_FOUNDATION, LAYER_QUALITY, LAYER_THEME]:
+        frac = LAYER_ALLOCATION[layer]
+        alloc_rows.append({
+            "層": LAYER_BADGES[layer],
+            "役割": LAYER_DESC[layer],
+            "配分目安": f"{frac*100:.0f}%",
+            "配分額": f"¥{total_capital * frac:,.0f}",
+            "運用ルール": LAYER_RULES[layer],
+        })
+    st.dataframe(pd.DataFrame(alloc_rows), use_container_width=True, hide_index=True)
+    st.caption(f"配分額はサイドバーの総資金 ¥{total_capital:,.0f} に対する目安です。")
+
+    # ── 市況判定（テーマ枠の新規可否に使用） ──
+    mr = get_macro_score()
+    macro_score = mr.get("score") if mr is not None else None
+
+    df = load_analysis()
+    if df is None or df.empty:
+        st.warning("分析データが見つかりません。先に `python run.py` を実行してください。")
+        return
+    pred_df = load_predictions()
+
+    # 実効上昇確率（1ヶ月・過去的中率補正）— 買い推奨TOP10と同じ計算を再利用
+    if pred_df is not None and not pred_df.empty:
+        merged, rates = compute_effective_prob_table(df.copy(), pred_df)
+    else:
+        merged = df.copy()
+        merged["eff_prob_30d"] = np.nan
+        rates = {}
+
+    merged["layer"] = merged.apply(
+        lambda r: classify_layer(r["ticker"], r.get("name", ""), r.get("sector", ""))[0],
+        axis=1,
+    )
+
+    hit30 = rates.get(30)
+    if hit30 is not None:
+        st.caption(f"実効確率(1ヶ月) = モデル上昇確率を過去的中率（1ヶ月 {hit30:.0f}%）で補正した値。降順で表示。")
+
+    st.markdown("---")
+
+    # ── 層ごとのセクション ──
+    for layer in [LAYER_FOUNDATION, LAYER_QUALITY, LAYER_THEME]:
+        sub = merged[merged["layer"] == layer].copy()
+        frac = LAYER_ALLOCATION[layer]
+        st.subheader(f"{LAYER_BADGES[layer]}（{len(sub)}銘柄 ｜ 配分目安 {frac*100:.0f}% = ¥{total_capital*frac:,.0f}）")
+        st.markdown(f"**運用ルール**: {LAYER_RULES[layer]}")
+
+        if layer == LAYER_FOUNDATION:
+            st.info("💡 ①土台のETFは予測対象外でも**定額積立が基本**（タイミングを計らず、下落時はバーゲンとして買い増し）。")
+        elif layer == LAYER_THEME:
+            if macro_score is not None and macro_score < 60:
+                st.error(f"🚫 市況判定が{macro_score}点（60点未満）のため、③テーマ枠の**新規エントリーは禁止**です。")
+            elif macro_score is not None:
+                st.caption(f"市況判定 {macro_score}点（60点以上）。③テーマは市況判定60点未満の日は新規禁止。")
+            else:
+                st.caption("③テーマは市況判定60点未満の日は新規禁止（本日の市況スコアは取得できませんでした）。")
+
+        if sub.empty:
+            st.caption("該当銘柄なし")
+            st.markdown("---")
+            continue
+
+        sub = sub.sort_values("eff_prob_30d", ascending=False, na_position="last")
+        view = pd.DataFrame({
+            "銘柄": sub["ticker"].values,
+            "名前": sub["name"].values,
+            "株価": [f"{v:,.2f}" if pd.notna(v) else "-" for v in sub["price"]],
+            "前日比": [f"{v:+.2f}%" if pd.notna(v) else "-" for v in sub["change_pct"]],
+            "実効確率(1ヶ月)": [f"{v*100:.0f}%" if pd.notna(v) else "-" for v in sub["eff_prob_30d"]],
+            "RSI": [f"{v:.1f}" if pd.notna(v) else "-" for v in sub["rsi_14"]],
+            "52週位置": [f"{v:.0f}%" if pd.notna(v) else "-" for v in sub["pos_52w_pct"]],
+            "リスク警告": [short_risk(r.get("risk_labels", ""), r.get("risk_count", 0))
+                       for _, r in sub.iterrows()],
+        })
+        st.dataframe(view, use_container_width=True, hide_index=True)
+        st.markdown("---")
+
+    st.caption(
+        "📌 注記: ①土台のETFは予測対象外でも定額積立が基本。"
+        "③テーマは市況判定60点未満の日は新規禁止。"
+        "層の判定は明示マッピング（LAYER_OVERRIDES）優先、辞書にない銘柄はセクター/名前のキーワードで自動分類しています。"
+    )
 
 
 # ──────────────────────────────────────────────
@@ -1645,6 +1878,7 @@ def page_backtest():
 
 if page == "ダッシュボード": page_dashboard()
 elif page == "銘柄チャート": page_chart()
+elif page == "3層ポートフォリオ": page_portfolio()
 elif page == "買い推奨TOP10": page_recommend()
 elif page == "バックテスト": page_backtest()
 elif page == "予測精度検証": page_accuracy()
