@@ -116,12 +116,17 @@ def compute_atr14(ohlc, period=14):
     return float(atr) if pd.notna(atr) else None
 
 
-def compute_execution_plan(ohlc, ticker, total_capital, risk_pct):
+def compute_execution_plan(ohlc, ticker, total_capital, risk_pct, usdjpy=None):
     """執行プラン計算（純粋関数: OHLC DataFrameから算出。テスト可能）
+
+    total_capital は円。米国株の場合は usdjpy でドル換算してから
+    リスク予算・ポジション上限を計算する。
+    ポジション上限: 総資金の25%（1銘柄集中の上限）。
 
     返却 dict:
       entry, stop, stop_pct, risk_per_share, shares, position_value,
-      take_profit, take_profit_pct, risk_amount, atr14, currency, is_jp
+      take_profit, take_profit_pct, risk_amount, atr14, currency, is_jp,
+      capped(上限適用), capital_ccy(銘柄通貨建て総資金)
       shares=0 のとき size_ok=False
     """
     import math
@@ -139,9 +144,18 @@ def compute_execution_plan(ohlc, ticker, total_capital, risk_pct):
     risk_per_share = entry - stop
     if risk_per_share <= 0:
         return None
-    risk_budget = float(total_capital) * float(risk_pct) / 100.0
-    shares = math.floor(risk_budget / risk_per_share)
     jp = is_jp_ticker(ticker)
+    # 総資金を銘柄の通貨に換算（円→ドル）
+    capital_ccy = float(total_capital)
+    if not jp:
+        fx = float(usdjpy) if usdjpy and float(usdjpy) > 0 else 150.0
+        capital_ccy = float(total_capital) / fx
+    risk_budget = capital_ccy * float(risk_pct) / 100.0
+    shares = math.floor(risk_budget / risk_per_share)
+    # ポジション上限: 総資金の25%まで（1銘柄集中の防止）
+    max_shares = math.floor(capital_ccy * 0.25 / entry) if entry > 0 else 0
+    capped = shares > max_shares
+    shares = min(shares, max_shares)
     if jp:
         shares = (shares // 100) * 100  # 100株単位に切り捨て
     position_value = shares * entry
@@ -161,6 +175,8 @@ def compute_execution_plan(ohlc, ticker, total_capital, risk_pct):
         "take_profit_pct": (take_profit - entry) / entry * 100,
         "currency": "¥" if jp else "$",
         "is_jp": jp,
+        "capped": capped,
+        "capital_ccy": capital_ccy,
     }
 
 
@@ -687,11 +703,26 @@ def _fmt_money(v, currency):
     return f"${v:,.2f}"
 
 
+def get_usdjpy():
+    """ドル円レートを macro データから取得（無ければ150でフォールバック）"""
+    try:
+        m = load_macro()
+        if m is not None:
+            row = m[m["ticker"] == "USDJPY=X"]
+            if not row.empty:
+                v = float(row["current_value"].iloc[0])
+                if v > 0:
+                    return v
+    except Exception:
+        pass
+    return 150.0
+
+
 def _render_execution_plan(ticker, total_capital, risk_pct):
     """買い推奨カード内の執行プランセクションを描画"""
     st.markdown("**📋 執行プラン**")
     ohlc = load_ohlc_dynamic(yf_symbol(ticker), period="3mo")
-    plan = compute_execution_plan(ohlc, ticker, total_capital, risk_pct)
+    plan = compute_execution_plan(ohlc, ticker, total_capital, risk_pct, usdjpy=get_usdjpy())
     if plan is None:
         st.caption("OHLCデータが取得できないため執行プランを計算できません（ネットワーク/データ不足）。")
         return
@@ -707,9 +738,14 @@ def _render_execution_plan(ticker, total_capital, risk_pct):
                           " — +2Rで半分利確、残りは損切りを建値へ"),
     ]
     if plan["size_ok"]:
-        rows.append(("株数", f"{plan['shares']:,}株" + ("（100株単位）" if plan["is_jp"] else "")))
-        rows.append(("投入額", _fmt_money(plan["position_value"], cur)))
-        rows.append(("想定リスク", f"{_fmt_money(plan['risk_amount'], cur)}（総資金の約{risk_pct:.1f}%）"))
+        cap_note = "（100株単位）" if plan["is_jp"] else ""
+        if plan.get("capped"):
+            cap_note += "（⚠️ ポジション上限25%を適用して縮小）"
+        rows.append(("株数", f"{plan['shares']:,}株" + cap_note))
+        pos_note = "" if plan["is_jp"] else f"（参考: 約¥{plan['position_value'] * get_usdjpy():,.0f}）"
+        rows.append(("投入額", _fmt_money(plan["position_value"], cur) + pos_note))
+        actual_risk_pct = plan["risk_amount"] / plan["capital_ccy"] * 100 if plan.get("capital_ccy") else risk_pct
+        rows.append(("想定リスク", f"{_fmt_money(plan['risk_amount'], cur)}（総資金の約{actual_risk_pct:.2f}%）"))
     else:
         rows.append(("株数", "⚠️ リスク許容内で買えるサイズなし（1株リスクが大きすぎます）"))
     if plan["is_jp"]:
