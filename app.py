@@ -86,6 +86,113 @@ def compute_macd(series, fast=12, slow=26, signal=9):
     return macd, sig, macd - sig
 
 
+def is_jp_ticker(ticker):
+    """日本株判定（ティッカーが数字始まり）"""
+    t = str(ticker)
+    return len(t) > 0 and t[0].isdigit()
+
+
+def yf_symbol(ticker):
+    """yfinance用シンボルに変換（日本株は .T を付与）"""
+    t = str(ticker)
+    if is_jp_ticker(t) and not t.endswith(".T"):
+        return t + ".T"
+    return t
+
+
+def compute_atr14(ohlc, period=14):
+    """ATR14 = TrueRange（High-Low, |High-prevClose|, |Low-prevClose| の最大値）の14日単純平均"""
+    if ohlc is None or len(ohlc) < period + 1:
+        return None
+    high = ohlc["High"].astype(float)
+    low = ohlc["Low"].astype(float)
+    prev_close = ohlc["Close"].astype(float).shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean().iloc[-1]
+    return float(atr) if pd.notna(atr) else None
+
+
+def compute_execution_plan(ohlc, ticker, total_capital, risk_pct):
+    """執行プラン計算（純粋関数: OHLC DataFrameから算出。テスト可能）
+
+    返却 dict:
+      entry, stop, stop_pct, risk_per_share, shares, position_value,
+      take_profit, take_profit_pct, risk_amount, atr14, currency, is_jp
+      shares=0 のとき size_ok=False
+    """
+    import math
+    if ohlc is None or ohlc.empty or len(ohlc) < 21:
+        return None
+    atr = compute_atr14(ohlc)
+    if atr is None or atr <= 0:
+        return None
+    last_close = float(ohlc["Close"].iloc[-1])
+    entry = last_close - 0.5 * atr
+    low20 = float(ohlc["Low"].tail(20).min())
+    stop = max(entry - 2 * atr, low20)  # 浅い方を採用
+    if stop >= entry:
+        stop = entry - 2 * atr
+    risk_per_share = entry - stop
+    if risk_per_share <= 0:
+        return None
+    risk_budget = float(total_capital) * float(risk_pct) / 100.0
+    shares = math.floor(risk_budget / risk_per_share)
+    jp = is_jp_ticker(ticker)
+    if jp:
+        shares = (shares // 100) * 100  # 100株単位に切り捨て
+    position_value = shares * entry
+    take_profit = entry + 2 * risk_per_share  # +2R
+    return {
+        "atr14": atr,
+        "last_close": last_close,
+        "entry": entry,
+        "stop": stop,
+        "stop_pct": (stop - entry) / entry * 100,
+        "risk_per_share": risk_per_share,
+        "shares": shares,
+        "size_ok": shares > 0,
+        "position_value": position_value,
+        "risk_amount": shares * risk_per_share,
+        "take_profit": take_profit,
+        "take_profit_pct": (take_profit - entry) / entry * 100,
+        "currency": "¥" if jp else "$",
+        "is_jp": jp,
+    }
+
+
+@st.cache_data(ttl=300)
+def load_prediction_history():
+    """過去予測の履歴（予測日, 基準価格, 予測%, 対象期間）を prediction_accuracy.csv から取得"""
+    p = DATA_DIR / "prediction_accuracy.csv"
+    if not p.exists():
+        return None
+    try:
+        df = pd.read_csv(p, encoding="utf-8-sig")
+        need = ["ticker", "prediction_date", "horizon_days", "base_price", "predicted_change_pct"]
+        if not all(c in df.columns for c in need):
+            return None
+        return df[need + (["horizon"] if "horizon" in df.columns else [])].dropna(
+            subset=["prediction_date", "base_price", "predicted_change_pct"])
+    except Exception:
+        return None
+
+
+def get_macro_score():
+    """市況判定スコアを算出（ダッシュボードと買い推奨TOP10で共通利用）"""
+    macro_df = load_macro()
+    if macro_df is None or macro_df.empty:
+        return None
+    try:
+        from analyzer import calculate_macro_score
+        return calculate_macro_score(macro_df)
+    except Exception:
+        return None
+
+
 # ──────────────────────────────────────────────
 # ページ設定
 # ──────────────────────────────────────────────
@@ -94,7 +201,7 @@ st.set_page_config(page_title="Growth Stock Analyzer", layout="wide")
 st.sidebar.title("Growth Stock Analyzer")
 page = st.sidebar.radio(
     "ページ選択",
-    ["ダッシュボード", "買い推奨TOP10", "バックテスト", "予測精度検証"],
+    ["ダッシュボード", "銘柄チャート", "買い推奨TOP10", "バックテスト", "予測精度検証"],
 )
 
 
@@ -147,6 +254,7 @@ def page_dashboard():
             _jst = _tz(_td(hours=9))
             _updated = _latest.tz_localize("UTC").astimezone(_jst).strftime("%Y/%m/%d %H:%M:%S")
             st.caption(f"🕐 データ最終更新: {_updated} (JST)")
+            st.caption("※ 株価・指数は前営業日終値ベースのスナップショットです。ザラ場中の現在値ではありません。")
         except Exception:
             pass
 
@@ -154,9 +262,8 @@ def page_dashboard():
     hcols = st.columns([3, 1])
     with hcols[0]:
         if macro_df is not None and not macro_df.empty:
-            try:
-                from analyzer import calculate_macro_score
-                mr = calculate_macro_score(macro_df)
+            mr = get_macro_score()
+            if mr is not None:
                 st.markdown(
                     f"### {mr['emoji']} 市況判定: **{mr['label']}** ({mr['score']}/100)",
                 )
@@ -166,8 +273,8 @@ def page_dashboard():
                     st.markdown(f"<div style='font-size:13px;line-height:1.6;white-space:pre-wrap'>"
                                 f"<b>【サマリー】</b>\n{summary}</div>",
                                 unsafe_allow_html=True)
-            except Exception as e:
-                st.warning(f"市況判定失敗: {e}")
+            else:
+                st.warning("市況判定失敗（マクロデータまたはanalyzer読み込みエラー）")
     with hcols[1]:
         if analysis_df is not None and "risk_count" in analysis_df.columns:
             total = len(analysis_df)
@@ -208,7 +315,6 @@ def page_dashboard():
     pred_headers = {
         7: ("1週後予測", "1週間後の総合予測。モメンタム寄り。過去的中率60%前後で実用水準"),
         30: ("1ヶ月後予測", "1ヶ月後の総合予測。モメンタム+ファンダ半々。スイング判断の主軸"),
-        90: ("3ヶ月後予測", "3ヶ月後の総合予測。ファンダメンタル主導。中長期投資判断の目安"),
     }
 
     pred_df = load_predictions()
@@ -344,6 +450,142 @@ def page_dashboard():
 
 
 # ──────────────────────────────────────────────
+# ページ: 銘柄チャート
+# ──────────────────────────────────────────────
+
+def page_chart():
+    st.header("📊 銘柄チャート")
+    analysis_df = load_analysis()
+    if analysis_df is None or analysis_df.empty:
+        st.warning("分析データが見つかりません。先に `python run.py` を実行してください。")
+        return
+
+    # ── 銘柄・期間選択 ──
+    opts = analysis_df[["ticker", "name"]].drop_duplicates("ticker")
+    labels = {r["ticker"]: f"{r['ticker']} {r['name']}" for _, r in opts.iterrows()}
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        ticker = st.selectbox("銘柄", list(labels.keys()),
+                              format_func=lambda t: labels.get(t, t))
+    with c2:
+        period = st.radio("期間", ["1mo", "3mo", "1y", "5y"], index=1, horizontal=True)
+
+    ohlc = load_ohlc_dynamic(yf_symbol(ticker), period=period)
+    if ohlc is None or ohlc.empty:
+        st.error(f"{ticker} のOHLCデータを取得できませんでした（yfinanceのネットワークエラーの可能性）。")
+        return
+
+    ohlc = ohlc.copy()
+    # tz情報を落として比較を単純化
+    try:
+        ohlc.index = pd.to_datetime(ohlc.index).tz_localize(None)
+    except TypeError:
+        ohlc.index = pd.to_datetime(ohlc.index)
+
+    arow = analysis_df[analysis_df["ticker"] == ticker]
+    arow = arow.iloc[0] if not arow.empty else None
+
+    # ── 3段サブプロット: ローソク足+MA / 出来高 / RSI ──
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True,
+        row_heights=[0.6, 0.2, 0.2], vertical_spacing=0.03,
+        subplot_titles=("価格", "出来高", "RSI14"),
+    )
+
+    fig.add_trace(go.Candlestick(
+        x=ohlc.index, open=ohlc["Open"], high=ohlc["High"],
+        low=ohlc["Low"], close=ohlc["Close"], name="OHLC",
+    ), row=1, col=1)
+
+    # 移動平均（計算可能な分だけ）
+    for win, color in [(25, "#f39c12"), (75, "#3498db"), (200, "#9b59b6")]:
+        if len(ohlc) >= win:
+            ma = ohlc["Close"].rolling(win).mean()
+            fig.add_trace(go.Scatter(
+                x=ohlc.index, y=ma, name=f"MA{win}",
+                line=dict(color=color, width=1.2),
+            ), row=1, col=1)
+
+    # 52週高値・安値の水平点線（分析CSVから）
+    if arow is not None:
+        for col_name, lab, color in [("high_52w", "52週高値", "#27ae60"),
+                                     ("low_52w", "52週安値", "#e74c3c")]:
+            v = arow.get(col_name)
+            if pd.notna(v):
+                fig.add_hline(y=float(v), line_dash="dot", line_color=color,
+                              annotation_text=f"{lab} {float(v):,.1f}",
+                              annotation_font_size=10, row=1, col=1)
+
+    # 出来高
+    vol_colors = np.where(ohlc["Close"] >= ohlc["Open"], "#27ae60", "#e74c3c")
+    fig.add_trace(go.Bar(
+        x=ohlc.index, y=ohlc["Volume"], name="出来高",
+        marker_color=vol_colors, opacity=0.7,
+    ), row=2, col=1)
+
+    # RSI14
+    rsi = compute_rsi(ohlc["Close"])
+    fig.add_trace(go.Scatter(
+        x=ohlc.index, y=rsi, name="RSI14",
+        line=dict(color="#e67e22", width=1.4),
+    ), row=3, col=1)
+    fig.add_hline(y=70, line_dash="dot", line_color="#e74c3c", row=3, col=1)
+    fig.add_hline(y=30, line_dash="dot", line_color="#27ae60", row=3, col=1)
+
+    # ── 過去予測オーバーレイ ──
+    hist = load_prediction_history()
+    n_overlay = 0
+    if hist is not None and not hist.empty:
+        h = hist[hist["ticker"] == ticker].copy()
+        if not h.empty:
+            h["prediction_date"] = pd.to_datetime(h["prediction_date"], errors="coerce")
+            h = h.dropna(subset=["prediction_date"])
+            h["target_date"] = h["prediction_date"] + pd.to_timedelta(h["horizon_days"], unit="D")
+            h["pred_price"] = h["base_price"] * (1 + h["predicted_change_pct"] / 100)
+            # チャート表示範囲内に限定
+            x_min = ohlc.index.min()
+            h = h[h["target_date"] >= x_min]
+            marker_map = {7: ("diamond-open", "1週予測 ◇", "#00bcd4"),
+                          30: ("x", "1ヶ月予測 ×", "#ff80ab")}
+            for d, (sym, lab, color) in marker_map.items():
+                sub = h[h["horizon_days"] == d].sort_values("target_date").tail(20)  # 直近20件に間引き
+                if sub.empty:
+                    continue
+                n_overlay += len(sub)
+                fig.add_trace(go.Scatter(
+                    x=sub["target_date"], y=sub["pred_price"],
+                    mode="markers", name=lab,
+                    marker=dict(symbol=sym, size=9, color=color,
+                                line=dict(width=1.5, color=color)),
+                    customdata=np.stack([
+                        sub["prediction_date"].dt.strftime("%Y-%m-%d"),
+                        sub["predicted_change_pct"],
+                        sub["base_price"],
+                    ], axis=-1),
+                    hovertemplate=(lab + "<br>予測日: %{customdata[0]}"
+                                   "<br>基準価格: %{customdata[2]:,.2f}"
+                                   "<br>予測: %{customdata[1]:+.2f}%"
+                                   "<br>予測株価: %{y:,.2f}（対象日 %{x|%Y-%m-%d}）"
+                                   "<extra></extra>"),
+                ), row=1, col=1)
+
+    fig.update_layout(
+        height=760,
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(t=60, b=20),
+    )
+    fig.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1)
+    st.plotly_chart(fig, use_container_width=True)
+
+    if n_overlay:
+        st.caption(f"◇/× は過去の予測点（予測日+対象期間の位置に 基準価格×(1+予測%) をプロット、各期間直近20件）。"
+                   f"表示中: {n_overlay}件。マーカーにマウスを合わせると予測値と日付が表示されます。")
+    else:
+        st.caption("この銘柄・期間に重なる過去予測データはありません。")
+
+
+# ──────────────────────────────────────────────
 # ページ2: 買い推奨TOP10
 # ──────────────────────────────────────────────
 
@@ -438,9 +680,81 @@ def _hit_rate_badge(hit_rate):
     return (f"{hit_rate:.0f}% ❌ 参考値以下", "#e74c3c")
 
 
+def _fmt_money(v, currency):
+    """通貨記号つき金額フォーマット"""
+    if currency == "¥":
+        return f"¥{v:,.0f}"
+    return f"${v:,.2f}"
+
+
+def _render_execution_plan(ticker, total_capital, risk_pct):
+    """買い推奨カード内の執行プランセクションを描画"""
+    st.markdown("**📋 執行プラン**")
+    ohlc = load_ohlc_dynamic(yf_symbol(ticker), period="3mo")
+    plan = compute_execution_plan(ohlc, ticker, total_capital, risk_pct)
+    if plan is None:
+        st.caption("OHLCデータが取得できないため執行プランを計算できません（ネットワーク/データ不足）。")
+        return
+    cur = plan["currency"]
+    stop_diff = plan["stop"] - plan["entry"]
+    tp_diff = plan["take_profit"] - plan["entry"]
+    rows = [
+        ("直近終値", _fmt_money(plan["last_close"], cur)),
+        ("ATR14", _fmt_money(plan["atr14"], cur)),
+        ("エントリー指値", f"{_fmt_money(plan['entry'], cur)}（終値 −0.5×ATR）"),
+        ("損切り", f"{_fmt_money(plan['stop'], cur)}（{_fmt_money(stop_diff, cur)} / {plan['stop_pct']:+.1f}%）"),
+        ("利確目安（+2R）", f"{_fmt_money(plan['take_profit'], cur)}（{_fmt_money(tp_diff, cur)} / {plan['take_profit_pct']:+.1f}%）"
+                          " — +2Rで半分利確、残りは損切りを建値へ"),
+    ]
+    if plan["size_ok"]:
+        rows.append(("株数", f"{plan['shares']:,}株" + ("（100株単位）" if plan["is_jp"] else "")))
+        rows.append(("投入額", _fmt_money(plan["position_value"], cur)))
+        rows.append(("想定リスク", f"{_fmt_money(plan['risk_amount'], cur)}（総資金の約{risk_pct:.1f}%）"))
+    else:
+        rows.append(("株数", "⚠️ リスク許容内で買えるサイズなし（1株リスクが大きすぎます）"))
+    if plan["is_jp"]:
+        rows.append(("執行時間帯", "寄り後30分は避ける（10:00以降の指値推奨）"))
+    else:
+        rows.append(("執行時間帯", "日本時間の就寝前にGTC指値+逆指値をセット"))
+    rows.append(("シグナル有効期限", "発出から3営業日。未約定なら失効"))
+
+    html = ['<table style="width:100%;font-size:12px;border-collapse:collapse">']
+    for label, val in rows:
+        html.append(
+            f'<tr style="border-top:1px solid rgba(255,255,255,0.08)">'
+            f'<td style="padding:4px 8px;white-space:nowrap;color:#aaa">{label}</td>'
+            f'<td style="padding:4px 8px">{val}</td></tr>'
+        )
+    html.append("</table>")
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+
 def page_recommend():
     st.header("💎 今買うべき銘柄 TOP10")
-    st.caption("スコア × 予測ハイブリッドで並び替えた、中期で最も買い妙味のある10銘柄。1週/1ヶ月/3ヶ月後の期待変化率・上昇確率・80%信頼区間つき。")
+    st.caption("1ヶ月実効上昇確率（過去的中率補正後）×期待値で並び替えた、中期で最も買い妙味のある銘柄。1週/1ヶ月後の期待変化率・上昇確率・80%信頼区間・執行プランつき。")
+
+    # ── 常設警告バナー（バックテスト結果） ──
+    st.warning(
+        "⚠️ この選定ロジックの5年バックテストは全戦略マイナス"
+        "（最良 質モメンタム×毎月 −59.7%、逆張り×毎週 −99.96%）。"
+        "本リストは『候補のスクリーニング』であり、そのまま買うリストではありません。"
+        "市況判定60点以上＋執行プランの損切り厳守を前提にしてください。"
+    )
+
+    # ── 市況判定スコア（60未満なら新規エントリー非推奨） ──
+    _mr = get_macro_score()
+    if _mr is not None and _mr.get("score") is not None and _mr["score"] < 60:
+        st.error(f"市況判定が{_mr['score']}点のため新規エントリー非推奨（待機モード）")
+
+    # ── サイドバー: 執行プラン用の資金設定 ──
+    total_capital = st.sidebar.number_input(
+        "総資金（円）", min_value=100_000, value=8_000_000, step=100_000,
+        key="exec_total_capital",
+    )
+    risk_pct = st.sidebar.number_input(
+        "1トレードのリスク（%）", min_value=0.5, max_value=3.0, value=1.0, step=0.1,
+        key="exec_risk_pct",
+    )
 
     df = load_analysis()
     pred_df = load_predictions()
@@ -497,18 +811,18 @@ def page_recommend():
     pred_cols = ["ticker",
                  "pred_7d_pct","pred_7d_l80","pred_7d_u80","pred_7d_l95","pred_7d_u95",
                  "pred_30d_pct","pred_30d_l80","pred_30d_u80","pred_30d_l95","pred_30d_u95",
-                 "pred_90d_pct","pred_90d_l80","pred_90d_u80","pred_90d_l95","pred_90d_u95",
-                 "pred_7d_conf","pred_30d_conf","pred_90d_conf"]
+                 "pred_7d_conf","pred_30d_conf"]
     keep = [c for c in pred_cols if c in pred_df.columns]
     merged = work.merge(pred_df[keep], on="ticker", how="left")
 
     # 上昇確率
     merged["prob_7d"] = merged.apply(lambda r: _up_probability(r.get("pred_7d_pct"), r.get("pred_7d_l95"), r.get("pred_7d_u95")), axis=1)
     merged["prob_30d"] = merged.apply(lambda r: _up_probability(r.get("pred_30d_pct"), r.get("pred_30d_l95"), r.get("pred_30d_u95")), axis=1)
-    merged["prob_90d"] = merged.apply(lambda r: _up_probability(r.get("pred_90d_pct"), r.get("pred_90d_l95"), r.get("pred_90d_u95")), axis=1)
 
-    # ハイブリッドスコア: 0.5×スコア正規化 + 0.5×(1週期待リターン × 上昇確率)
-    #   期待値正規化: max 15%で打ち切り → 0..1
+    # ── 過去の方向的中率（モデル成績表）──
+    rates = _historical_hit_rates()
+
+    # ハイブリッドスコア（アクション判定用に残置）: 0.5×スコア正規化 + 0.5×(1週期待リターン × 上昇確率)
     def _ev_norm(pct, prob):
         if pd.isna(pct) or pd.isna(prob):
             return 0.0
@@ -522,21 +836,50 @@ def page_recommend():
         axis=1
     ) * 100
 
-    # 予測データが欠けている銘柄は除外
-    merged = merged.dropna(subset=["pred_7d_pct", "prob_7d"])
+    # ── ランキングスコア（一本化）: 1ヶ月実効上昇確率 × 期待値ベース ──
+    hit30 = rates.get(30)
 
-    top = merged.sort_values("hybrid_score", ascending=False).head(10).reset_index(drop=True)
+    def _eff30(r):
+        eff = _effective_probability(r.get("prob_30d"), hit30)
+        if eff is None:
+            # 的中率データがない場合はモデル確率をそのまま使う
+            p = r.get("prob_30d")
+            eff = float(p) if pd.notna(p) else None
+        return eff
+
+    merged["eff_prob_30d"] = merged.apply(_eff30, axis=1)
+    # 確率加重期待値（%）= 1ヶ月期待変化率 × 実効上昇確率
+    merged["ev_30d"] = merged.apply(
+        lambda r: float(r["pred_30d_pct"]) * float(r["eff_prob_30d"])
+        if pd.notna(r.get("pred_30d_pct")) and pd.notna(r.get("eff_prob_30d")) else np.nan,
+        axis=1,
+    )
+    # ランクスコア = 実効確率(0-100) + 確率加重期待値(%) − リスク警告1件につき5点減点
+    merged["rank_score"] = merged.apply(
+        lambda r: (float(r["eff_prob_30d"]) * 100 + float(r["ev_30d"])
+                   - 5 * int(r.get("risk_count", 0) or 0))
+        if pd.notna(r.get("eff_prob_30d")) and pd.notna(r.get("ev_30d")) else np.nan,
+        axis=1,
+    )
+
+    # 予測データが欠けている銘柄は除外
+    merged = merged.dropna(subset=["pred_7d_pct", "prob_7d", "pred_30d_pct", "prob_30d",
+                                   "eff_prob_30d", "rank_score"])
+
+    # 1ヶ月実効確率55%以上のみメインリスト。未達は下部に折りたたみ表示
+    qualified = merged[merged["eff_prob_30d"] >= 0.55]
+    below = merged[merged["eff_prob_30d"] < 0.55].sort_values("rank_score", ascending=False)
+
+    top = qualified.sort_values("rank_score", ascending=False).head(10).reset_index(drop=True)
 
     if top.empty:
-        st.warning("推奨できる銘柄が見つかりませんでした。")
-        return
-
-    # ── 過去の方向的中率（モデル成績表） ──
-    rates = _historical_hit_rates()
+        st.warning("実効上昇確率55%以上の推奨銘柄がありません（基準未達の銘柄はページ下部の参考表示を参照）。")
 
     with st.expander("📖 このページの読み方（重要）", expanded=False):
         st.markdown("""
-**ハイブリッドスコア** = 総合スコア × 0.5 + 1週後期待値（予測%×上昇確率）× 0.5
+**並び順** = 1ヶ月実効上昇確率（過去的中率で補正）×100 + 確率加重期待値（1ヶ月期待変化率×実効確率）− リスク警告1件につき5点減点
+
+実効上昇確率（1ヶ月）が**55%未満**の銘柄はメインリストに載せず、ページ下部の「基準未達」に折りたたんでいます。
 
 **3種類の「確率」を使い分けます:**
 - **上昇確率** — モデルが今回の予測から算出した「ロジック上の確率」。最高99%まで出ることも
@@ -549,10 +892,10 @@ def page_recommend():
 - 1ヶ月の区間が [-18% 〜 +37%] のように広い場合、期待値がプラスでも下振れリスクが大きい
 """)
 
-    # 過去的中率テーブル（本編） v6: 7/30/90日
+    # 過去的中率テーブル（本編） 7/30日
     if rates:
-        cols = st.columns(3)
-        for col, (d, lab) in zip(cols, [(7,"1週後"), (30,"1ヶ月後"), (90,"3ヶ月後")]):
+        cols = st.columns(2)
+        for col, (d, lab) in zip(cols, [(7,"1週後"), (30,"1ヶ月後")]):
             h = rates.get(d)
             if h is None:
                 col.metric(lab + " 的中率", "-")
@@ -587,6 +930,9 @@ def page_recommend():
         risk_labels = row.get("risk_labels", "")
         upside = row.get("upside_pct", None)
 
+        eff30 = row.get("eff_prob_30d", None)
+        rank_sc = row.get("rank_score", 0)
+
         action_label, action_bg = _signal_action(signal, total_score, hybrid)
         mkt_flag = "🇺🇸" if market == "US" else ("🇯🇵" if market == "JP" else "🌐")
         change_color = "#27ae60" if change >= 0 else "#e74c3c"
@@ -605,7 +951,8 @@ def page_recommend():
 </div>
 </div>
 <div style="margin-top:8px;font-size:13px;color:#ddd">
-  {action_label} ｜ ハイブリッドスコア: <b>{hybrid:.1f}</b> ｜ 総合スコア: {total_score:.1f} ｜ シグナル: {signal}
+  {action_label} ｜ 🎯 実効上昇確率（1ヶ月）: <b style="color:{_prob_color(eff30)};font-size:15px">{(eff30*100):.0f}%</b>
+  ｜ ランクスコア: {rank_sc:.1f} ｜ シグナル: {signal}
 </div>
 </div>
 """, unsafe_allow_html=True)
@@ -626,7 +973,7 @@ def page_recommend():
 <th style="padding:6px 8px">80%信頼区間</th>
 </tr></thead><tbody>
 """)
-            for d, lab in [(7,"1週間後"), (30,"1ヶ月後"), (90,"3ヶ月後")]:
+            for d, lab in [(7,"1週間後"), (30,"1ヶ月後")]:
                 pct = row.get(f"pred_{d}d_pct")
                 prob = row.get(f"prob_{d}d")
                 l80 = row.get(f"pred_{d}d_l80")
@@ -690,12 +1037,30 @@ def page_recommend():
                 with st.expander("📝 アナライザーコメント"):
                     st.caption(str(analysis_comment))
 
+        # 執行プラン（ATRベースのエントリー/損切り/サイズ計算）
+        _render_execution_plan(ticker, total_capital, risk_pct)
+
         st.markdown("---")
+
+    # ── 基準未達銘柄（実効確率55%未満）の参考表示 ──
+    if not below.empty:
+        with st.expander(f"⚠️ 基準未達（実効確率55%未満）— 参考表示（{len(below)}銘柄）", expanded=False):
+            st.caption("1ヶ月実効上昇確率が55%に届かない銘柄です。エッジが薄いため新規エントリーは非推奨。")
+            ref = below[["ticker", "name", "sector", "market", "price",
+                         "eff_prob_30d", "pred_30d_pct", "rank_score",
+                         "total_score", "signal", "risk_labels"]].copy()
+            ref["eff_prob_30d"] = (ref["eff_prob_30d"] * 100).map(lambda x: f"{x:.0f}%")
+            ref["pred_30d_pct"] = ref["pred_30d_pct"].map(lambda x: f"{x:+.2f}%")
+            ref["rank_score"] = ref["rank_score"].round(1)
+            ref.columns = ["銘柄", "名前", "セクター", "市場", "株価",
+                           "実効確率(1ヶ月)", "1ヶ月予測", "ランクスコア",
+                           "総合スコア", "シグナル", "リスク"]
+            st.dataframe(ref, use_container_width=True, hide_index=True)
 
     # まとめダウンロード用CSV
     export_cols = ["ticker","name","sector","market","price","change_pct",
-                   "hybrid_score","total_score","signal",
-                   "pred_7d_pct","prob_7d","pred_30d_pct","prob_30d","pred_90d_pct","prob_90d",
+                   "rank_score","eff_prob_30d","hybrid_score","total_score","signal",
+                   "pred_7d_pct","prob_7d","pred_30d_pct","prob_30d",
                    "rsi_14","pos_52w_pct","revenue_growth_pct","upside_pct","analysis_comment"]
     avail = [c for c in export_cols if c in top.columns]
     csv = top[avail].to_csv(index=False).encode("utf-8-sig")
@@ -1243,6 +1608,7 @@ def page_backtest():
 # ──────────────────────────────────────────────
 
 if page == "ダッシュボード": page_dashboard()
+elif page == "銘柄チャート": page_chart()
 elif page == "買い推奨TOP10": page_recommend()
 elif page == "バックテスト": page_backtest()
 elif page == "予測精度検証": page_accuracy()
